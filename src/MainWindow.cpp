@@ -9,6 +9,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QUdpSocket>
+#include <QHostAddress>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QDialogButtonBox>
@@ -59,6 +61,127 @@
 #include <algorithm>
 
 namespace {
+// DARC ShortRY: DA-DR identify German-issued callsigns.  A leading
+// foreign operating prefix (e.g. F/DL1ABC) takes precedence; suffixes
+// such as /P and /T do not change the country of operation.
+bool isDarcGermanCall(const QString &rawCall) {
+  const QString call = rawCall.trimmed().toUpper();
+  const QStringList parts = call.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+  if (parts.isEmpty()) return false;
+  static const QRegularExpression german(QStringLiteral("^D[A-R][0-9]"));
+  static const QRegularExpression foreignPrefix(QStringLiteral("^[A-Z0-9]{1,4}$"));
+  if (parts.size() > 1 && foreignPrefix.match(parts.first()).hasMatch() &&
+      !german.match(parts.first()).hasMatch() &&
+      german.match(parts.at(1)).hasMatch()) return false;
+  return german.match(parts.first()).hasMatch();
+}
+
+// Explicit operating location overrides callsign-based defaults.  The
+// setting is intentionally shared by macro TX, QSO logging and Cabrillo.
+bool darcOperatingInDl(const QString &stationCall) {
+  const QSettings settings;
+  const QString selected = settings.value(QStringLiteral("contest/darcLocation")).toString();
+  if (selected == QStringLiteral("DL")) return true;
+  if (selected == QStringLiteral("Non-DL")) return false;
+  return isDarcGermanCall(stationCall);
+}
+
+// Transliterate Unicode to the 7-bit character repertoire used by RTTY/ITA2.
+// Transliteration is applied before whitespace compaction and uppercasing.
+QString rttyUpperAscii(const QString &value) {
+  QString result;
+  result.reserve(value.size());
+  const QString normalized = value.normalized(QString::NormalizationForm_D);
+  for (int i = 0; i < normalized.size(); ++i) {
+    const QChar ch = normalized.at(i);
+    if (i + 1 < normalized.size() && normalized.at(i + 1).unicode() == 0x0308) {
+      const QChar base = ch.toUpper();
+      if (base == QLatin1Char('A') || base == QLatin1Char('O') || base == QLatin1Char('U')) {
+        result += base; result += QLatin1Char('E'); ++i; continue;
+      }
+    }
+    const ushort code = ch.unicode();
+    // German umlauts must retain their conventional two-letter spelling.
+    switch (code) {
+      case 0x00C4: case 0x00E4: result += QStringLiteral("AE"); continue;
+      case 0x00D6: case 0x00F6: result += QStringLiteral("OE"); continue;
+      case 0x00DC: case 0x00FC: result += QStringLiteral("UE"); continue;
+      case 0x00DF: case 0x1E9E: result += QStringLiteral("SS"); continue;
+      case 0x00C6: case 0x00E6: result += QStringLiteral("AE"); continue;
+      case 0x0152: case 0x0153: result += QStringLiteral("OE"); continue;
+      case 0x00D8: case 0x00F8: result += QLatin1Char('O'); continue;
+      case 0x0141: case 0x0142: result += QLatin1Char('L'); continue;
+      case 0x00D0: case 0x00F0: result += QLatin1Char('D'); continue;
+      case 0x00DE: case 0x00FE: result += QStringLiteral("TH"); continue;
+      default: break;
+    }
+    // Unicode NFD combining accents: drop accents, preserve base letters.
+    if (code >= 0x0300 && code <= 0x036F) continue;
+    const QChar upper = ch.toUpper();
+    if (upper.unicode() < 128) result += upper;
+    else if (ch.isSpace()) result += QLatin1Char(' ');
+    else result += QLatin1Char(' '); // Unsupported glyph cannot be sent via ITA2.
+  }
+  return result;
+}
+
+// Match rttyTCI field normalization: uppercase and collapse whitespace.
+// Keep a trailing space during editing; trim edges only on editingFinished.
+QString normalizedUpperField(const QString &value, bool trimEdges) {
+  QString result;
+  result.reserve(value.size());
+  bool lastSpace = false;
+  for (const QChar ch : rttyUpperAscii(value)) {
+    if (ch.isSpace()) {
+      if (!lastSpace) result.append(QLatin1Char(' '));
+      lastSpace = true;
+    } else {
+      result.append(ch);
+      lastSpace = false;
+    }
+  }
+  return trimEdges ? result.trimmed() : result;
+}
+
+void normalizeUpperEdit(QLineEdit *edit, bool compact = true) {
+  auto normalize = [edit, compact](bool trimEdges) {
+    const QString before = edit->text();
+    const QString after = compact ? normalizedUpperField(before, trimEdges) : rttyUpperAscii(before);
+    if (before == after) return;
+    const int cursor = edit->cursorPosition();
+    const int mapped = (compact ? normalizedUpperField(before.left(cursor), trimEdges)
+                                : rttyUpperAscii(before.left(cursor))).size();
+    const QSignalBlocker blocker(edit);
+    edit->setText(after);
+    edit->setCursorPosition(std::min(mapped, int(after.size())));
+  };
+  normalize(false);
+  QObject::connect(edit, &QLineEdit::textEdited, edit, [normalize](const QString &) {
+    normalize(false);
+  });
+  if (compact) QObject::connect(edit, &QLineEdit::editingFinished, edit, [normalize] {
+    normalize(true);
+  });
+}
+
+// Preserve the current TX selection when normalizing pasted or typed text.
+void uppercaseTxEditor(QPlainTextEdit *edit) {
+  QObject::connect(edit, &QPlainTextEdit::textChanged, edit, [edit] {
+    const QString before = edit->toPlainText();
+    const QString after = rttyUpperAscii(before);
+    if (before == after) return;
+    QTextCursor cursor = edit->textCursor();
+    const int anchor = rttyUpperAscii(before.left(cursor.anchor())).size();
+    const int position = rttyUpperAscii(before.left(cursor.position())).size();
+    const QSignalBlocker blocker(edit);
+    edit->setPlainText(after);
+    cursor = edit->textCursor();
+    cursor.setPosition(std::min(anchor, int(after.size())));
+    cursor.setPosition(std::min(position, int(after.size())), QTextCursor::KeepAnchor);
+    edit->setTextCursor(cursor);
+  });
+}
+
 class DecodePickView final : public QPlainTextEdit {
 public:
   using QPlainTextEdit::QPlainTextEdit;
@@ -146,8 +269,6 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   resize(1200, 740);
   setMinimumSize(1100, 740);
   auto *setupMenu = menuBar()->addMenu(QStringLiteral("Setup"));
-  setupMenu->addAction(QStringLiteral("Station settings…"), this, [this] { editStationSettings(); });
-  setupMenu->addAction(QStringLiteral("Macros…"), this, [this] { editMacro(0); });
   // The compact in-window Setup button is retained. On macOS, expose
   // Help -> About in the native menu bar as well.
 #ifdef Q_OS_MACOS
@@ -195,6 +316,58 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
           QStringLiteral("Save SDR mode and DIGI offsets, select DIGL for RTTY, restore on disconnect. Changes take effect on next connection."));
   connect(autoSetupAction, &QAction::toggled, this, [](bool enabled) {
     QSettings().setValue(QStringLiteral("tci/autoSetupDeskHPSDR"), enabled);
+  });
+  setupPopup->addSeparator();
+  auto *sendLogAction = setupPopup->addAction(QStringLiteral("Send log via UDP"));
+  sendLogAction->setCheckable(true);
+  sendLogAction->setChecked(QSettings().value(QStringLiteral("log/sendViaUdp"), true).toBool());
+  sendLogAction->setToolTip(QStringLiteral("Send ADIF to the configured UDP target after successful local save; disabled in Contest Mode."));
+  connect(sendLogAction, &QAction::toggled, this, [](bool enabled) {
+    QSettings().setValue(QStringLiteral("log/sendViaUdp"), enabled);
+  });
+  setupPopup->addAction(QStringLiteral("UDP Log Settings…"), this, [this, sendLogAction] {
+    QSettings settings;
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("UDP Log Settings"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout();
+    auto *enabled = new QCheckBox(QStringLiteral("Send log via UDP"), &dialog);
+    enabled->setChecked(settings.value(QStringLiteral("log/sendViaUdp"), true).toBool());
+    auto *host = new QLineEdit(settings.value(QStringLiteral("log/udpHost"),
+                                              QStringLiteral("127.0.0.1")).toString(), &dialog);
+    auto *port = new QSpinBox(&dialog);
+    port->setRange(1, 65535);
+    port->setValue(settings.value(QStringLiteral("log/udpPort"), 12063).toInt());
+    form->addRow(enabled);
+    form->addRow(QStringLiteral("UDP Host"), host);
+    form->addRow(QStringLiteral("UDP Port"), port);
+    layout->addLayout(form);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
+    layout->addWidget(buttons);
+    connect(enabled, &QCheckBox::toggled, &dialog, [host, port](bool on) {
+      host->setEnabled(on);
+      port->setEnabled(on);
+    });
+    host->setEnabled(enabled->isChecked());
+    port->setEnabled(enabled->isChecked());
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+      if (enabled->isChecked()) {
+        QHostAddress address;
+        if (!address.setAddress(host->text().trimmed()) ||
+            address.protocol() != QAbstractSocket::IPv4Protocol) {
+          QMessageBox::warning(&dialog, QStringLiteral("Invalid UDP target"),
+                               QStringLiteral("Enter a valid IPv4 address."));
+          return;
+        }
+      }
+      dialog.accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) return;
+    settings.setValue(QStringLiteral("log/sendViaUdp"), enabled->isChecked());
+    settings.setValue(QStringLiteral("log/udpHost"), host->text().trimmed());
+    settings.setValue(QStringLiteral("log/udpPort"), port->value());
+    sendLogAction->setChecked(enabled->isChecked());
   });
   setupPopup->addSeparator();
   setupPopup->addAction(QStringLiteral("Decoder font size…"), this, [this] {
@@ -255,6 +428,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 #ifdef Q_OS_MACOS
   connect(aboutMenuAction, &QAction::triggered, this, showAbout);
 #endif
+  // Both entry points share the exact same QAction instances: identical
+  // commands, check states and enabled states without duplicate handlers.
+  for (QAction *action : setupPopup->actions()) {
+#ifdef Q_OS_MACOS
+    // macOS already exposes About in the native Help/application menu.
+    if (action->text() == QStringLiteral("About rttyPad…")) continue;
+#endif
+    setupMenu->addAction(action);
+  }
   setupButton->setMenu(setupPopup);
   connectionRow->addWidget(host_);
   connectionRow->addWidget(port_);
@@ -445,6 +627,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   qsoName_ = qsoField(QStringLiteral("NAME"), 125);
   qsoSent_ = qsoField(QStringLiteral("S"), 50, QStringLiteral("599"));
   qsoReceived_ = qsoField(QStringLiteral("R"), 50, QStringLiteral("599"));
+  for (QLineEdit *edit : {qsoCall_, qsoName_, qsoSent_, qsoReceived_})
+    normalizeUpperEdit(edit);
   // Contest-only QSO fields form one unit so their labels disappear too.
   auto *contestFields = new QWidget(central);
   auto *contestFieldsLayout = new QHBoxLayout(contestFields);
@@ -452,6 +636,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   contestFieldsLayout->setSpacing(5);
   contestFieldsLayout->addWidget(new QLabel(QStringLiteral("EXCH"), contestFields));
   contestExchange_ = new QLineEdit(contestFields);
+  normalizeUpperEdit(contestExchange_);
   contestExchange_->setFixedWidth(75);
   contestFieldsLayout->addWidget(contestExchange_);
   contestSerial_ = new QSpinBox(central);
@@ -524,11 +709,6 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
       qsoName_->setFocus();
     }
   };
-  connect(qsoCall_, &QLineEdit::textEdited, this, [this](const QString & text) {
-    const int position = qsoCall_->cursorPosition();
-    qsoCall_->setText(text.toUpper());
-    qsoCall_->setCursorPosition(position);
-  });
   auto *newQso = new QPushButton(QStringLiteral("New QSO"), central);
   connect(newQso, &QPushButton::clicked, this, [this] {
     qsoCall_->clear();
@@ -597,6 +777,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   txInput_->setFixedHeight(52);
   txInput_->setStyleSheet(QStringLiteral("QPlainTextEdit { background: #0e0e0e; color: #e0e0e0; border: 0; }"));
   txInput_->setFont(QFont(QStringLiteral("Menlo"), 14));
+  uppercaseTxEditor(txInput_);
   connect(clearTx, &QPushButton::clicked, txInput_, &QPlainTextEdit::clear);
   layout->addWidget(txInput_);
   // AppKit echoes outgoing text into the decoded traffic pane, not a
@@ -1102,7 +1283,7 @@ void MainWindow::editMacro(int index) {
   auto *outer = new QVBoxLayout(&dialog);
   outer->setSpacing(7);
   if (contest) {
-    outer->addWidget(new QLabel(darc ? QStringLiteral("DARC RTTY Kurzcontest Setup — enter DOK or NM for a non-member.")
+    outer->addWidget(new QLabel(darc ? QStringLiteral("DARC RTTY Kurzcontest — DL sends DOK/NM, Non-DL sends serial 001 onward.")
                                 : (cqww ? QStringLiteral("CQ WW RTTY — exchange is RST plus CQ zone.")
                                    : QStringLiteral("SARTG RTTY — exchange is RST plus serial number.")), &dialog));
   }
@@ -1117,14 +1298,29 @@ void MainWindow::editMacro(int index) {
     stationGrid->addWidget(new QLabel(QLatin1String(stationLabels[i]), station), row, col);
     stationEdits[i] = new QLineEdit(settings.value(
                                             QStringLiteral("station/%1").arg(QLatin1String(stationKeys[i]))).toString(), station);
+    normalizeUpperEdit(stationEdits[i]);
     stationGrid->addWidget(stationEdits[i], row, col + 1);
   }
   QLineEdit *dokEdit = nullptr;
+  QComboBox *darcLocation = nullptr;
   if (darc) {
+    stationGrid->addWidget(new QLabel(QStringLiteral("Station Location"), station), 2, 0);
+    darcLocation = new QComboBox(station);
+    darcLocation->addItems({QStringLiteral("DL"), QStringLiteral("Non-DL")});
+    const QString storedLocation = settings.value(QStringLiteral("contest/darcLocation")).toString();
+    darcLocation->setCurrentText(storedLocation == QStringLiteral("DL") || storedLocation == QStringLiteral("Non-DL")
+        ? storedLocation : (isDarcGermanCall(stationEdits[0]->text()) ? QStringLiteral("DL") : QStringLiteral("Non-DL")));
+    darcLocation->setToolTip(QStringLiteral("Operating country for ShortRY. Override for portable or foreign operation."));
+    stationGrid->addWidget(darcLocation, 2, 1);
     stationGrid->addWidget(new QLabel(QStringLiteral("DOK"), station), 0, 4);
     dokEdit = new QLineEdit(settings.value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString(), station);
+    normalizeUpperEdit(dokEdit);
     dokEdit->setMaximumWidth(110);
     stationGrid->addWidget(dokEdit, 0, 5);
+    dokEdit->setEnabled(darcLocation->currentText() == QStringLiteral("DL"));
+    connect(darcLocation, &QComboBox::currentTextChanged, dokEdit, [dokEdit](const QString &value) {
+      dokEdit->setEnabled(value == QStringLiteral("DL"));
+    });
   }
   auto *showSMeter = new QCheckBox(QStringLiteral("Show S-meter"), station);
   showSMeter->setChecked(settings.value(QStringLiteral("rx/show_smeter"), false).toBool());
@@ -1147,11 +1343,13 @@ void MainWindow::editMacro(int index) {
       contestMode_->isChecked() ? (contestType_->currentText() == QStringLiteral("CQ-WW-RTTY") &&
                                    i == 5 ? QStringLiteral("ZONE?") : QStringList{QStringLiteral("CQ"), QStringLiteral("CALL"), QStringLiteral("EXCH"), QStringLiteral("TU"), QStringLiteral("AGN"), QStringLiteral("NR?"), QStringLiteral("QRZ"), QStringLiteral("73")}.at(
                                            i)) : QLatin1String(defaults[i])).toString(), content);
+    normalizeUpperEdit(labels[i], false);
     labels[i]->setMaximumWidth(110);
     grid->addWidget(labels[i], i + 1, 1);
     texts[i] = new QLineEdit(settings.value(base + QStringLiteral("text"),
                                             contestMode_->isChecked() ? defaultContestMacroText(i, contestType_->currentText() == QStringLiteral("CQ-WW-RTTY"),
                                               contestType_->currentText() == QStringLiteral("DARC-RTTY")) : defaultMacroText(i)).toString(), content);
+    normalizeUpperEdit(texts[i], false);
     grid->addWidget(texts[i], i + 1, 2);
   }
   grid->setColumnStretch(2, 1);
@@ -1237,6 +1435,7 @@ void MainWindow::editMacro(int index) {
   for (int i = 0; i < 4; ++i)
     settings.setValue(QStringLiteral("station/%1").arg(QLatin1String(stationKeys[i])),
                       stationEdits[i]->text().trimmed().toUpper());
+  if (darcLocation) settings.setValue(QStringLiteral("contest/darcLocation"), darcLocation->currentText());
   if (dokEdit) settings.setValue(QStringLiteral("contest/dok"),
                                    dokEdit->text().trimmed().toUpper().isEmpty() ? QStringLiteral("NM") : dokEdit->text().trimmed().toUpper());
   settings.setValue(QStringLiteral("rx/show_smeter"), showSMeter->isChecked());
@@ -1279,7 +1478,14 @@ void MainWindow::logQsoAdif() {
   auto *grid = field(QStringLiteral("LOC"), QString());
   auto *qth = field(QStringLiteral("QTH"), QString());
   auto *comment = field(QStringLiteral("COMMENT"), QString());
+  for (QLineEdit *edit : {call, name, sent, received, grid, qth})
+    normalizeUpperEdit(edit);
   layout->addLayout(form);
+  // UDP destination is configured in Setup, never in the QSO entry dialog.
+  const bool sendUdp = settings.value(QStringLiteral("log/sendViaUdp"), true).toBool();
+  const QString udpHost = settings.value(QStringLiteral("log/udpHost"),
+                                         QStringLiteral("127.0.0.1")).toString();
+  const int udpPort = settings.value(QStringLiteral("log/udpPort"), 12063).toInt();
   layout->addWidget(new QLabel(QStringLiteral("Station: %1    MY GRID: %2    MODE: RTTY")
                                .arg(stationCall.isEmpty() ? QStringLiteral("--") : stationCall,
                                     myGrid.isEmpty() ? QStringLiteral("--") : myGrid), &dialog));
@@ -1383,6 +1589,32 @@ void MainWindow::logQsoAdif() {
     QMessageBox::critical(this, QStringLiteral("QSO not logged"), file.errorString());
     return;
   }
+  // Match native rttyTCI: transmit the ADIF record, not the file header,
+  // and only after the local append has succeeded. Contest QSOs use a
+  // separate log and never pass through this function.
+  if (sendUdp) {
+    QHostAddress address;
+    const bool validHost = address.setAddress(udpHost) &&
+                           address.protocol() == QAbstractSocket::IPv4Protocol;
+    if (!validHost || udpPort < 1 || udpPort > 65535) {
+      log_->appendPlainText(QStringLiteral("LOG UDP: invalid target (check Setup → UDP Log Settings)"));
+    } else {
+      QUdpSocket socket;
+      const QByteArray payload = record.trimmed();
+      const qint64 sent = socket.writeDatagram(payload, address, static_cast<quint16>(udpPort));
+      if (sent != payload.size()) {
+        const QString error = socket.errorString();
+        log_->appendPlainText(QStringLiteral("LOG UDP: failed %1:%2 — %3")
+                              .arg(udpHost).arg(udpPort).arg(error));
+        QMessageBox::warning(this, QStringLiteral("Log UDP send failed"),
+                             QStringLiteral("The QSO was saved locally to %1.\n\nUDP error: %2")
+                             .arg(path, error));
+      } else {
+        log_->appendPlainText(QStringLiteral("LOG UDP: sent CALL=%1 to %2:%3")
+                              .arg(callValue).arg(udpHost).arg(udpPort));
+      }
+    }
+  }
   qsoCall_->clear();
   qsoName_->clear();
   qsoReceived_->setText(QStringLiteral("599"));
@@ -1409,6 +1641,7 @@ void MainWindow::editStationSettings() {
     edits[i] = new QLineEdit(&dialog);
     edits[i]->setText(settings.value(QLatin1String(fields[i].key),
                                      QLatin1String(fields[i].defaultValue)).toString());
+    normalizeUpperEdit(edits[i]);
     form->addRow(QLatin1String(fields[i].label), edits[i]);
   }
   layout->addLayout(form);
@@ -1419,7 +1652,7 @@ void MainWindow::editStationSettings() {
   if (dialog.exec() != QDialog::Accepted) { return; }
   for (int i = 0; i < 5; ++i) {
     QString value = edits[i]->text().trimmed();
-    if (i == 0 || i == 3) { value = value.toUpper(); }
+    value = normalizedUpperField(value, true);
     settings.setValue(QLatin1String(fields[i].key), value);
   }
 }
@@ -1465,7 +1698,9 @@ void MainWindow::runMacro(int index) {
       return;
     }
     body.replace(QStringLiteral("<MYDOK>"),
-                 settings.value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString().trimmed().toUpper(),
+                 darcOperatingInDl(settings.value(QStringLiteral("station/callsign")).toString())
+                   ? settings.value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString().trimmed().toUpper()
+                   : QStringLiteral("%1").arg(contestSerial_->value(), 3, 10, QLatin1Char('0')),
                  Qt::CaseInsensitive);
   }
   // Resolve contest exchange before general tokens. CQ WW sends CQ zone,
@@ -1480,7 +1715,7 @@ void MainWindow::runMacro(int index) {
     QString exchange = cqww ? QString::number(number)
                        : QStringLiteral("%1").arg(number, 3, 10, QLatin1Char('0'));
     if (contestType_->currentText() == QStringLiteral("DARC-RTTY") &&
-        settings.value(QStringLiteral("station/callsign")).toString().trimmed().toUpper().startsWith(QLatin1Char('D'))) {
+        darcOperatingInDl(settings.value(QStringLiteral("station/callsign")).toString())) {
       exchange = settings.value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString().trimmed().toUpper();
     }
     body.replace(QStringLiteral("<EXCH>"), exchange, Qt::CaseInsensitive);
@@ -1818,12 +2053,14 @@ void MainWindow::updateContestUi() {
     button->setEnabled(enabled);
   }
   dupeLabel_->clear();
-  if (!enabled) { return; }
+  if (!enabled) { contestSerial_->setEnabled(true); return; }
   const bool cqww = contestType_->currentText() == QStringLiteral("CQ-WW-RTTY");
   const bool darc = contestType_->currentText() == QStringLiteral("DARC-RTTY");
   contestSerial_->setMaximum(cqww ? 40 : 99999);
+  const bool dlOperator = darc && darcOperatingInDl(QSettings().value(QStringLiteral("station/callsign")).toString());
+  contestSerial_->setEnabled(!dlOperator);
   contestSerial_->setToolTip(cqww ? QStringLiteral("Own CQ zone (1–40), not a running serial")
-                             : (darc ? QStringLiteral("Next DARC short contest serial number")
+                             : (darc ? QStringLiteral("Next DARC short contest serial number (Non-DL only)")
                                 : QStringLiteral("Next SARTG serial number")));
   const QString call = qsoCall_->text().trimmed().toUpper();
   const QString band = contestBand();
@@ -1860,10 +2097,16 @@ void MainWindow::logContestQso() {
   if (darc) {
     // AppKit: German calls require DOK or NM; DX stations send a
     // numeric serial (empty is logged as 000).
-    if (call.startsWith(QLatin1Char('D'))) {
+    if (isDarcGermanCall(call)) {
       if (exchange.isEmpty()) {
         QMessageBox::warning(this, QStringLiteral("DARC RTTY"),
                              QStringLiteral("German stations require a received DOK or NM."));
+        return;
+      }
+      static const QRegularExpression dok(QStringLiteral("^[A-Z0-9]{1,8}$"));
+      if (!dok.match(exchange).hasMatch()) {
+        QMessageBox::warning(this, QStringLiteral("DARC RTTY"),
+                             QStringLiteral("Received DOK/NM must contain 1–8 letters or digits."));
         return;
       }
       normalizedExchange = exchange;
@@ -1921,9 +2164,10 @@ void MainWindow::logContestQso() {
     QString::number(qRound64(tciFrequencyHz_ / 1000.0)),
     qsoSent_->text().trimmed(), qsoReceived_->text().trimmed(),
     normalizedExchange,
-    darc && QSettings().value(QStringLiteral("station/callsign")).toString().trimmed().toUpper().startsWith(QLatin1Char('D'))
+    darc && darcOperatingInDl(QSettings().value(QStringLiteral("station/callsign")).toString())
     ? QSettings().value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString().trimmed().toUpper()
-    : QString::number(contestSerial_->value()),
+    : (darc ? QStringLiteral("%1").arg(contestSerial_->value(), 3, 10, QLatin1Char('0'))
+            : QString::number(contestSerial_->value())),
     QStringLiteral("DX")
   };
   for (const QString &field : fields) {
@@ -1940,7 +2184,8 @@ void MainWindow::logContestQso() {
                           QStringLiteral("Contest log could not be saved: %1").arg(output.errorString()));
     return;
   }
-  if (contestType_->currentText() != QStringLiteral("CQ-WW-RTTY")) {
+  if (contestType_->currentText() == QStringLiteral("SARTG-WW-RTTY") ||
+      (darc && !darcOperatingInDl(QSettings().value(QStringLiteral("station/callsign")).toString()))) {
     contestSerial_->setValue(contestSerial_->value() + 1);
   }
   qsoCall_->clear();
@@ -2060,6 +2305,8 @@ void MainWindow::showContestLog() {
     auto *exchange = new QLineEdit(QString::fromUtf8(fields.at(8)), &editor);
     auto *sentExchange = new QLineEdit(QString::fromUtf8(fields.at(9)), &editor);
     auto *frequency = new QLineEdit(QString::fromUtf8(fields.at(5)), &editor);
+    for (QLineEdit *edit : {call, sentRst, receivedRst, exchange, sentExchange})
+      normalizeUpperEdit(edit);
     form->addRow(QStringLiteral("CALL"), call);
     form->addRow(QStringLiteral("Frequency (kHz)"), frequency);
     form->addRow(QStringLiteral("RST sent"), sentRst);
@@ -2179,8 +2426,13 @@ void MainWindow::exportContestCabrillo() {
   config.setWindowTitle(QStringLiteral("Cabrillo Settings"));
   auto *form = new QFormLayout(&config);
   auto *power = new QComboBox(&config);
-  power->addItems({QStringLiteral("HIGH"), QStringLiteral("LOW"), QStringLiteral("QRP")});
-  power->setCurrentText(settings.value(QStringLiteral("cabrillo/power"), QStringLiteral("LOW")).toString());
+  if (darc) {
+    power->addItems({QStringLiteral("LOW"), QStringLiteral("QRP")});
+  } else {
+    power->addItems({QStringLiteral("HIGH"), QStringLiteral("LOW"), QStringLiteral("QRP")});
+  }
+  const QString savedPower = settings.value(QStringLiteral("cabrillo/power"), QStringLiteral("LOW")).toString();
+  power->setCurrentText(darc && savedPower == QStringLiteral("HIGH") ? QStringLiteral("LOW") : savedPower);
   auto *operatorCategory = new QComboBox(&config);
   operatorCategory->addItems({QStringLiteral("SINGLE-OP"), QStringLiteral("CHECKLOG")});
   operatorCategory->setCurrentText(settings.value(QStringLiteral("cabrillo/operator"),
@@ -2358,6 +2610,25 @@ void MainWindow::exportContestCabrillo() {
                             QStringLiteral("Invalid QSO data on contest log line %1. Correct the QSO before exporting.")
                             .arg(recordNumber));
       return;
+    }
+    if (darc) {
+      const QString band = QString::fromUtf8(fields.at(3)).trimmed().toUpper();
+      const QString received = rawReceived.trimmed().toUpper();
+      const QString sent = rawSent.trimmed().toUpper();
+      static const QRegularExpression dok(QStringLiteral("^[A-Z0-9]{1,8}$"));
+      static const QRegularExpression serial(QStringLiteral("^[0-9]{3}$"));
+      const bool rxValid = isDarcGermanCall(rawCall)
+          ? (dok.match(received).hasMatch() && !serial.match(received).hasMatch())
+          : serial.match(received).hasMatch();
+      const bool txValid = darcOperatingInDl(station)
+          ? (dok.match(sent).hasMatch() && !serial.match(sent).hasMatch())
+          : serial.match(sent).hasMatch();
+      if ((band != QStringLiteral("80M") && band != QStringLiteral("40M")) || !rxValid || !txValid) {
+        QMessageBox::critical(this, QStringLiteral("Cabrillo"),
+                              QStringLiteral("Invalid ShortRY band or DL/DX exchange on line %1. Correct the QSO before exporting.")
+                                  .arg(recordNumber));
+        return;
+      }
     }
     const QString frequency = QString::fromUtf8(fields.at(5)).rightJustified(5, QLatin1Char(' '));
     const QString date = QString::fromUtf8(fields.at(1));

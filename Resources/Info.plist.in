@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundleIdentifier</key><string>org.dl1bz.rttyPad</string>
+<key>CFBundleName</key><string>rttyPad</string>
+<key>CFBundleDisplayName</key><string>rttyPad</string>
+<key>CFBundleExecutable</key><string>rttyPad</string>
+<key>CFBundleIconFile</key><string>AppIcon.icns</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleDevelopmentRegion</key><string>en</string>
+<key>CFBundleShortVersionString</key><string>@PROJECT_VERSION@</string>
+<key>CFBundleVersion</key><string>@RTTYPAD_BUNDLE_BUILD_VERSION@</string>
+<key>CFBundleGetInfoString</key><string>rttyPad: Native RTTY Terminal for deskHPSDR via TCI</string>
+<key>NSHumanReadableCopyright</key><string>Copyright (C) 2026 by Heiko Amft, DL1BZ</string>
+<key>NSLocalNetworkUsageDescription</key><string>rttyPad requires access to the local network for communication with deskHPSDR via TCI.</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>LSMinimumSystemVersion</key><string>15.0</string>
+</dict></plist>

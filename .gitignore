@@ -1,8 +1,9 @@
 /build/
 /build-*/
 /dist*
-/.DS_Store
+.DS_Store
 *.orig
 *.o
 *.tgz
 *.patch
+*.zip

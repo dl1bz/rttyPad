@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets WebSockets)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets WebSockets Network)
 
 add_library(rtty_core STATIC
     src/Baudot.c
@@ -31,7 +31,7 @@ add_executable(rttyPad
     src/NativeRTTYTx.h
     Resources/icons.qrc
 )
-target_link_libraries(rttyPad PRIVATE Qt6::Widgets Qt6::WebSockets rtty_core)
+target_link_libraries(rttyPad PRIVATE Qt6::Widgets Qt6::WebSockets Qt6::Network rtty_core)
 target_compile_definitions(rttyPad PRIVATE RTTYPAD_VERSION=\"${PROJECT_VERSION}\")
 
 # Use the Windows GUI subsystem (no additional console window).
@@ -40,13 +40,20 @@ if(WIN32)
 endif()
 
 if(APPLE)
-    set_source_files_properties(Resources/AppIcon.icns PROPERTIES
-        MACOSX_PACKAGE_LOCATION "Resources")
-    target_sources(rttyPad PRIVATE Resources/AppIcon.icns)
+    math(EXPR RTTYPAD_BUNDLE_BUILD_VERSION
+        "${PROJECT_VERSION_MAJOR} * 10000 + ${PROJECT_VERSION_MINOR} * 100 + ${PROJECT_VERSION_PATCH}")
+    configure_file(Resources/Info.plist.in "${CMAKE_CURRENT_BINARY_DIR}/rttyPad-Info.plist" @ONLY)
+    set_source_files_properties(Resources/AppIcon.icns PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+    set_source_files_properties(Resources/PkgInfo PROPERTIES MACOSX_PACKAGE_LOCATION ".")
+    target_sources(rttyPad PRIVATE Resources/AppIcon.icns Resources/PkgInfo)
     set_target_properties(rttyPad PROPERTIES
         MACOSX_BUNDLE TRUE
-        MACOSX_BUNDLE_ICON_FILE AppIcon.icns
-        MACOSX_BUNDLE_BUNDLE_NAME "rttyPad")
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/rttyPad-Info.plist"
+        MACOSX_BUNDLE_ICON_FILE "AppIcon.icns"
+        MACOSX_BUNDLE_BUNDLE_NAME "rttyPad"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "org.dl1bz.rttyPad"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${RTTYPAD_BUNDLE_BUILD_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
 endif()
 
 # Embed the icon in the Windows executable (Explorer/taskbar).
