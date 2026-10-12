@@ -7,7 +7,7 @@ rttyPad for deskHPSDR is an extension app for RTTY in combination with my deskHP
 ## The concept behind - what it's make for and what it isn't for
 
 rttyPad requires deskHPSDR as backend, because it use the since deskHPSDR version 2.8.x build-in RTTY TX engine. RX audio for decoding RTTY need TCI audio streaming. Analogue audio support is not available. In contrast to rttyTCI, which has an own RTTY TX encoder build-in and can work out-of-the-box with every app which provide TCI audio streaming in RX and TX directions, rttyPad need deskHPSDR as frontend. It's made as an extension app especially and exclusive for deskHPSDR with the following basic options
-- send/encode and receive/decode RTTY
+- send/encode (deskHPSDR required by using it's build-in RTTY TX engine) and receive/decode RTTY using TCI only, no analogue audio support
 - macro support for design your own text templates
 - own logging with ADIF log export or UDP live log send in Flexradio format
 - Contest module with own logging, special contest macros and Cabrillo export
