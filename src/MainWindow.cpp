@@ -1,0 +1,2416 @@
+#include "MainWindow.h"
+#include "RTTYScopeWidget.h"
+
+#include <QFormLayout>
+#include <QFont>
+#include <QDialog>
+#include <QDateTime>
+#include <QDate>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QStandardPaths>
+#include <QDialogButtonBox>
+#include <QMenuBar>
+#include <QInputDialog>
+#include <QFileDialog>
+#include <QTextStream>
+#include <QScrollArea>
+#include <QMessageBox>
+#include <QApplication>
+#include <QPixmap>
+#include <QMenu>
+#include <QRegularExpression>
+#include <QSettings>
+#include <QSignalBlocker>
+#include <QSet>
+#include <QDoubleSpinBox>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QSpinBox>
+#include <QTimer>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QIntValidator>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPlainTextEdit>
+#include <QSizePolicy>
+#include <QPushButton>
+#include <QSettings>
+#include <QStatusBar>
+#include <QSplitter>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <QTextCursor>
+#include <QTextCharFormat>
+#include <QColor>
+#include <QTextBlock>
+#include <QTableWidget>
+#include <QHeaderView>
+#include <QAbstractItemView>
+#include <QMouseEvent>
+#include <QEvent>
+#include <QCloseEvent>
+#include <functional>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+
+namespace {
+class DecodePickView final : public QPlainTextEdit {
+public:
+    using QPlainTextEdit::QPlainTextEdit;
+    std::function<void(const QString &)> onPicked;
+protected:
+    void mouseDoubleClickEvent(QMouseEvent *event) override {
+        // Determine the word under the mouse, not the previous selection.
+        QTextCursor cursor = cursorForPosition(event->pos());
+        cursor.select(QTextCursor::WordUnderCursor);
+        QString picked = cursor.selectedText().trimmed();
+        // Preserve slash and hyphen inside callsigns when Qt's word
+        // selection splits them into separate tokens.
+        const QString line = cursor.block().text();
+        const int column = cursorForPosition(event->pos()).positionInBlock();
+        if (column >= 0 && column < line.size()) {
+            auto isToken = [](QChar c) {
+                return c.isLetterOrNumber() || c == QLatin1Char('/') || c == QLatin1Char('-');
+            };
+            int first = column;
+            int last = column;
+            if (!isToken(line.at(first)) && first > 0 && isToken(line.at(first - 1))) --first;
+            if (isToken(line.at(first))) {
+                last = first + 1;
+                while (first > 0 && isToken(line.at(first - 1))) --first;
+                while (last < line.size() && isToken(line.at(last))) ++last;
+                picked = line.mid(first, last - first);
+            }
+        }
+        QPlainTextEdit::mouseDoubleClickEvent(event);
+        if (!picked.isEmpty() && onPicked) onPicked(picked);
+    }
+};
+
+// Match the native AppKit CQ WW state/province validation.  DX is the
+// Cabrillo placeholder for contacts outside continental USA/Canada.
+bool validCQWWQthR(const QString &value)
+{
+    static const QSet<QString> codes = {
+        QStringLiteral("AL"), QStringLiteral("AK"), QStringLiteral("AZ"), QStringLiteral("AR"),
+        QStringLiteral("CA"), QStringLiteral("CO"), QStringLiteral("CT"), QStringLiteral("DE"),
+        QStringLiteral("FL"), QStringLiteral("GA"), QStringLiteral("HI"), QStringLiteral("ID"),
+        QStringLiteral("IL"), QStringLiteral("IN"), QStringLiteral("IA"), QStringLiteral("KS"),
+        QStringLiteral("KY"), QStringLiteral("LA"), QStringLiteral("ME"), QStringLiteral("MD"),
+        QStringLiteral("MA"), QStringLiteral("MI"), QStringLiteral("MN"), QStringLiteral("MS"),
+        QStringLiteral("MO"), QStringLiteral("MT"), QStringLiteral("NE"), QStringLiteral("NV"),
+        QStringLiteral("NH"), QStringLiteral("NJ"), QStringLiteral("NM"), QStringLiteral("NY"),
+        QStringLiteral("NC"), QStringLiteral("ND"), QStringLiteral("OH"), QStringLiteral("OK"),
+        QStringLiteral("OR"), QStringLiteral("PA"), QStringLiteral("RI"), QStringLiteral("SC"),
+        QStringLiteral("SD"), QStringLiteral("TN"), QStringLiteral("TX"), QStringLiteral("UT"),
+        QStringLiteral("VT"), QStringLiteral("VA"), QStringLiteral("WA"), QStringLiteral("WV"),
+        QStringLiteral("WI"), QStringLiteral("WY"), QStringLiteral("DC"), QStringLiteral("AB"),
+        QStringLiteral("BC"), QStringLiteral("MB"), QStringLiteral("NB"), QStringLiteral("NL"),
+        QStringLiteral("NS"), QStringLiteral("NT"), QStringLiteral("NU"), QStringLiteral("ON"),
+        QStringLiteral("PE"), QStringLiteral("QC"), QStringLiteral("SK"), QStringLiteral("YT")
+    };
+    return value == QStringLiteral("DX") || codes.contains(value);
+}
+
+double tonePower(const float *samples, size_t count, double sampleRate, double frequency)
+{
+    const double coefficient = 2.0 * std::cos(2.0 * 3.14159265358979323846 * frequency / sampleRate);
+    double q1 = 0.0, q2 = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        const double q0 = coefficient * q1 - q2 + samples[i];
+        q2 = q1;
+        q1 = q0;
+    }
+    return std::max(0.0, q1 * q1 + q2 * q2 - coefficient * q1 * q2);
+}
+
+double localTonePeak(const float *samples, size_t count, double sampleRate,
+                     double centerHz, double &level)
+{
+    level = 0.0;
+    double bestHz = 0.0;
+    const double low = std::max(50.0, centerHz - 75.0);
+    const double high = std::min(sampleRate * 0.45, centerHz + 75.0);
+    for (double hz = low; hz <= high; hz += 5.0) {
+        const double power = tonePower(samples, count, sampleRate, hz);
+        if (power > level) { level = power; bestHz = hz; }
+    }
+    return bestHz;
+}
+}
+
+MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
+{
+    setWindowTitle(QStringLiteral("rttyPad for deskHPSDR by DL1BZ — DIGL — Disconnected"));
+    resize(1200, 740);
+    setMinimumSize(1100, 740);
+    auto *setupMenu = menuBar()->addMenu(QStringLiteral("Setup"));
+    setupMenu->addAction(QStringLiteral("Station settings…"), this, [this] { editStationSettings(); });
+    setupMenu->addAction(QStringLiteral("Macros…"), this, [this] { editMacro(0); });
+    // The compact in-window Setup button is retained. On macOS, expose
+    // Help -> About in the native menu bar as well.
+#ifdef Q_OS_MACOS
+    menuBar()->setNativeMenuBar(true);
+    auto *helpMenu = menuBar()->addMenu(QStringLiteral("Help"));
+    auto *aboutMenuAction = helpMenu->addAction(QStringLiteral("About rttyPad…"));
+    aboutMenuAction->setMenuRole(QAction::AboutRole);
+#else
+    menuBar()->hide();
+#endif
+
+    auto *central = new QWidget(this);
+    central->setObjectName(QStringLiteral("rttyRoot"));
+    auto *layout = new QVBoxLayout(central);
+    layout->setContentsMargins(20, 12, 20, 10);
+    layout->setSpacing(5);
+    central->setStyleSheet(QStringLiteral(
+        "QWidget#rttyRoot { background: #1c1f20; color: #e0e0e0; }"
+        "QLineEdit, QDoubleSpinBox, QPlainTextEdit { background: #212121; color: #e0e0e0; border: 1px solid #2b3034; border-radius: 3px; }"
+        "QPushButton { padding: 2px 8px; min-height: 17px; }"
+        "QLabel { color: #e0e0e0; }"));
+
+    // AppKit top line: connection and operating controls on one compact row.
+    auto *connectionRow = new QHBoxLayout();
+    connectionRow->setSpacing(6);
+    host_ = new QLineEdit(central);
+    host_->setObjectName(QStringLiteral("tciHost"));
+    host_->setFixedWidth(150);
+    host_->setText(QSettings().value(QStringLiteral("tci/host"), QStringLiteral("127.0.0.1")).toString());
+    port_ = new QLineEdit(central);
+    port_->setObjectName(QStringLiteral("tciPort"));
+    port_->setValidator(new QIntValidator(1, 65535, port_));
+    port_->setFixedWidth(72);
+    port_->setText(QSettings().value(QStringLiteral("tci/port"), 50001).toString());
+    connectButton_ = new QPushButton(QStringLiteral("Connect"), central);
+    connectionLabel_ = new QLabel(QStringLiteral("Disconnected"), central);
+    auto *setupButton = new QPushButton(QStringLiteral("Setup"), central);
+    // Keep the compact Setup control, with decoder typography configurable.
+    auto *setupPopup = new QMenu(setupButton);
+    setupPopup->addAction(QStringLiteral("Macros…"), this, [this] { editMacro(0); });
+    setupPopup->addAction(QStringLiteral("Station settings…"), this, [this] { editStationSettings(); });
+    setupPopup->addSeparator();
+    auto *autoSetupAction = setupPopup->addAction(QStringLiteral("Auto Setup deskHPSDR"));
+    autoSetupAction->setCheckable(true);
+    autoSetupAction->setChecked(QSettings().value(QStringLiteral("tci/autoSetupDeskHPSDR"), true).toBool());
+    autoSetupAction->setToolTip(QStringLiteral("Save SDR mode and DIGI offsets, select DIGL for RTTY, restore on disconnect. Changes take effect on next connection."));
+    connect(autoSetupAction, &QAction::toggled, this, [](bool enabled) {
+        QSettings().setValue(QStringLiteral("tci/autoSetupDeskHPSDR"), enabled);
+    });
+    setupPopup->addSeparator();
+    setupPopup->addAction(QStringLiteral("Decoder font size…"), this, [this] {
+        const int current = QSettings().value(QStringLiteral("ui/decoderFontSize"), 11).toInt();
+        bool accepted = false;
+        const int size = QInputDialog::getInt(this, QStringLiteral("Decoder font size"),
+                                              QStringLiteral("JetBrains Mono (pt):"),
+                                              std::clamp(current, 8, 20), 8, 20, 1, &accepted);
+        if (!accepted) return;
+        QFont font(QStringLiteral("JetBrains Mono"));
+        font.setPointSize(size);
+        font.setWeight(QFont::Normal);
+        font.setStyleHint(QFont::Monospace);
+        decoder_->setFont(font);
+        QSettings().setValue(QStringLiteral("ui/decoderFontSize"), size);
+    });
+    setupPopup->addSeparator();
+    auto showAbout = [this] {
+        QDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("About rttyPad"));
+        dialog.setModal(true);
+        dialog.setMinimumWidth(330);
+
+        auto *content = new QVBoxLayout(&dialog);
+        content->setContentsMargins(26, 22, 26, 18);
+        content->setSpacing(10);
+
+        auto *icon = new QLabel(&dialog);
+        const QPixmap logo(QStringLiteral(":/icons/AppIcon.png"));
+        icon->setPixmap(logo.scaled(72, 72, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        icon->setAlignment(Qt::AlignCenter);
+        content->addWidget(icon);
+
+        auto *name = new QLabel(QStringLiteral("<b>rttyPad for deskHPSDR</b>"), &dialog);
+        name->setAlignment(Qt::AlignCenter);
+        content->addWidget(name);
+
+        auto *version = new QLabel(QStringLiteral("Version %1").arg(QStringLiteral(RTTYPAD_VERSION)), &dialog);
+        version->setAlignment(Qt::AlignCenter);
+        content->addWidget(version);
+
+        auto *description = new QLabel(
+            QStringLiteral("RTTY Terminal and Contest Logger for deskHPSDR"), &dialog);
+        description->setAlignment(Qt::AlignCenter);
+        description->setWordWrap(true);
+        content->addWidget(description);
+
+        auto *author = new QLabel(QStringLiteral("Developed by DL1BZ"), &dialog);
+        author->setAlignment(Qt::AlignCenter);
+        content->addWidget(author);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::accept);
+        content->addWidget(buttons);
+        dialog.exec();
+    };
+    setupPopup->addAction(QStringLiteral("About rttyPad…"), this, showAbout);
+#ifdef Q_OS_MACOS
+    connect(aboutMenuAction, &QAction::triggered, this, showAbout);
+#endif
+    setupButton->setMenu(setupPopup);
+    connectionRow->addWidget(host_);
+    connectionRow->addWidget(port_);
+    connectionRow->addWidget(connectButton_);
+    connectionRow->addWidget(connectionLabel_);
+    reverse_ = new QCheckBox(QStringLiteral("Reverse"), central);
+    reverse_->setChecked(QSettings().value(QStringLiteral("rx/reverse"), false).toBool());
+    connectionRow->addWidget(reverse_);
+    // AppKit keeps mode selection in the top toolbar, not in the QSO entry row.
+    auto *strictToggle = new QCheckBox(QStringLiteral("Strict"), central);
+    strictToggle->setToolTip(QStringLiteral("Require six stable gate blocks and a plausible RTTY sequence"));
+    strictToggle->setChecked(QSettings().value(QStringLiteral("rx/strictLock"), false).toBool());
+    strictLock_ = strictToggle;
+    connect(strictToggle, &QCheckBox::toggled, this, [this](bool enabled) {
+        QSettings().setValue(QStringLiteral("rx/strictLock"), enabled);
+        strictGateBlocks_ = 0;
+        noCarrierBlocks_ = 0;
+        decodedLocked_ = false;
+        pendingDecoded_.clear();
+    });
+    connectionRow->addWidget(strictToggle);
+    connectionRow->addWidget(setupButton);
+    contestMode_ = new QCheckBox(QStringLiteral("Contest"), central);
+    contestMode_->setChecked(QSettings().value(QStringLiteral("contest/enabled"), false).toBool());
+    connectionRow->addWidget(contestMode_);
+    contestType_ = new QComboBox(central);
+    contestType_->addItems({QStringLiteral("DARC-RTTY"), QStringLiteral("SARTG-WW-RTTY"), QStringLiteral("CQ-WW-RTTY")});
+    contestType_->setCurrentText(QSettings().value(QStringLiteral("contest/type"), QStringLiteral("DARC-RTTY")).toString());
+    contestType_->setFixedWidth(132);
+    connectionRow->addWidget(contestType_);
+    auto *exportContest = new QPushButton(QStringLiteral("Contest Log"), central);
+    connectionRow->addWidget(exportContest);
+    connectionRow->addStretch(1);
+    layout->addLayout(connectionRow);
+
+    // Parameters occupy a narrow strip immediately below the connection row.
+    auto *parameterRow = new QHBoxLayout();
+    parameterRow->setSpacing(9);
+    auto addParameter = [central, parameterRow](const QString &name, QWidget *field) {
+        auto *column = new QVBoxLayout();
+        column->setSpacing(2);
+        column->addWidget(new QLabel(name, central));
+        column->addWidget(field);
+        parameterRow->addLayout(column);
+    };
+    center_ = new QDoubleSpinBox(central);
+    center_->setRange(100.0, 12000.0);
+    center_->setDecimals(1);
+    center_->setSingleStep(10.0);
+    center_->setFixedWidth(82);
+    center_->setValue(QSettings().value(QStringLiteral("rx/pitchHz"), 2210.0).toDouble());
+    addParameter(QStringLiteral("Pitch"), center_);
+    shift_ = new QDoubleSpinBox(central);
+    shift_->setRange(50.0, 1000.0);
+    shift_->setDecimals(1);
+    shift_->setSingleStep(10.0);
+    shift_->setFixedWidth(78);
+    shift_->setValue(QSettings().value(QStringLiteral("rx/shiftHz"), 170.0).toDouble());
+    addParameter(QStringLiteral("Shift"), shift_);
+    baud_ = new QDoubleSpinBox(central);
+    baud_->setRange(30.0, 300.0);
+    baud_->setDecimals(4);
+    baud_->setSingleStep(0.01);
+    baud_->setFixedWidth(90);
+    baud_->setValue(QSettings().value(QStringLiteral("rx/baud"), 45.45).toDouble());
+    addParameter(QStringLiteral("Baud"), baud_);
+    sql_ = new QDoubleSpinBox(central);
+    sql_->setRange(0.001, 0.25);
+    sql_->setDecimals(3);
+    sql_->setSingleStep(0.005);
+    sql_->setFixedWidth(80);
+    sql_->setValue(QSettings().value(QStringLiteral("rx/sqlOpen"), 0.030).toDouble());
+    addParameter(QStringLiteral("SQL"), sql_);
+    idleTimeout_ = new QSpinBox(central);
+    idleTimeout_->setRange(1, 600);
+    idleTimeout_->setFixedWidth(64);
+    idleTimeout_->setValue(QSettings().value(QStringLiteral("tx/idleTimeout"), 25).toInt());
+    addParameter(QStringLiteral("Idle s"), idleTimeout_);
+    auto *applyButton = new QPushButton(QStringLiteral("Apply"), central);
+    connect(applyButton, &QPushButton::clicked, this, [this] {
+        configureRx();
+        if (!tci_.isConnected()) return;
+        // Only an explicit user Apply writes the offset to deskHPSDR.
+        // Incoming TCI updates and local decoder reconfiguration never echo it.
+        const int hz = qRound(center_->value());
+        if (hz < 100 || hz > 4000) {
+            statusBar()->showMessage(QStringLiteral("DIGI offset must be between 100 and 4000 Hz"), 5000);
+            return;
+        }
+        const bool digu = tciMode_ == QStringLiteral("DIGU");
+        if (sessionRestoring_ || (autoSetupSession_ &&
+            (!snapshotModeReady_ || !snapshotDiglReady_ || !snapshotDiguReady_))) {
+            statusBar()->showMessage(QStringLiteral("Waiting for original TCI settings"), 5000);
+            return;
+        }
+        // Without Auto Setup, Apply remains a manual change and is not
+        // automatically restored. Never create an incomplete snapshot.
+        if (autoSetupSession_) {
+            if (digu) sessionChangedDigu_ = true;
+            else sessionChangedDigl_ = true;
+        }
+        tci_.sendText(QStringLiteral("%1:%2;")
+                          .arg(digu ? QStringLiteral("digu_offset") : QStringLiteral("digl_offset"))
+                          .arg(hz));
+    });
+    parameterRow->addWidget(applyButton, 0, Qt::AlignBottom);
+    parameterRow->addStretch();
+    layout->addLayout(parameterRow);
+
+    // Upper band: compact scope at left, tuning LEDs, and TCI diagnostics at right.
+    auto *upper = new QHBoxLayout();
+    upper->setSpacing(20);
+    scopeWidget_ = new RTTYScopeWidget(central);
+    scopeWidget_->setFixedSize(420, 200);
+    upper->addWidget(scopeWidget_, 0, Qt::AlignTop);
+    // Keep the diagnostics column stable when AFC values change every RX block.
+    auto *tuningColumn = new QWidget(central);
+    tuningColumn->setFixedWidth(110);
+    tuningColumn->setFixedHeight(200);
+    auto *tuning = new QVBoxLayout(tuningColumn);
+    tuning->setContentsMargins(0, 0, 0, 0);
+    tuning->setSpacing(8);
+    auto *markRow = new QHBoxLayout();
+    markRow->addWidget(new QLabel(QStringLiteral("MARK"), central));
+    markLed_ = new QLabel(QStringLiteral("●"), central);
+    markLed_->setStyleSheet(QStringLiteral("color: #45565c; font-size: 20px; font-weight: bold;"));
+    markRow->addWidget(markLed_);
+    tuning->addLayout(markRow);
+    auto *spaceRow = new QHBoxLayout();
+    spaceRow->addWidget(new QLabel(QStringLiteral("SPACE"), central));
+    spaceLed_ = new QLabel(QStringLiteral("●"), central);
+    spaceLed_->setStyleSheet(QStringLiteral("color: #45565c; font-size: 20px; font-weight: bold;"));
+    spaceRow->addWidget(spaceLed_);
+    tuning->addLayout(spaceRow);
+    afcLabel_ = new QLabel(QStringLiteral("AFC -- Hz"), central);
+    afcLabel_->setFixedWidth(110);
+    tuning->addWidget(afcLabel_);
+    tuning->addStretch();
+    upper->addWidget(tuningColumn, 0, Qt::AlignTop);
+    log_ = new QPlainTextEdit(central);
+    log_->setObjectName(QStringLiteral("tciLog"));
+    log_->setReadOnly(true);
+    log_->setStyleSheet(QStringLiteral("QPlainTextEdit { background: #191a1b; color: #a8a8a8; border: 0; }"));
+    log_->setFont(QFont(QStringLiteral("JetBrains Mono"), 11));
+    log_->document()->setMaximumBlockCount(1000);
+    log_->setMinimumWidth(240);
+    log_->setFixedHeight(200);
+    log_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    upper->addWidget(log_, 1, Qt::AlignTop);
+    layout->addLayout(upper);
+
+    // Full-width decoder below the scope, matching AppKit's reading order.
+    auto *decoderHeading = new QHBoxLayout();
+    decoderHeading->addWidget(new QLabel(QStringLiteral("Decoded RTTY"), central));
+    rxStatus_ = new QLabel(QStringLiteral("QRG —  |  MODE DIGL"), central);
+    decoderHeading->addWidget(rxStatus_, 1);
+    auto *clearRx = new QPushButton(QStringLiteral("Clear"), central);
+    decoderHeading->addWidget(clearRx);
+    layout->addLayout(decoderHeading);
+    auto *decodeView = new DecodePickView(central);
+    decoder_ = decodeView;
+    decoder_->setReadOnly(true);
+    decoder_->setObjectName(QStringLiteral("rttyDecoder"));
+    decoder_->document()->setMaximumBlockCount(2000);
+    decoder_->setStyleSheet(QStringLiteral("QPlainTextEdit { background: #181a1b; color: #e0e0e0; border: 0; }"));
+    QFont decoderFont(QStringLiteral("JetBrains Mono"));
+    decoderFont.setPointSize(std::clamp(QSettings().value(QStringLiteral("ui/decoderFontSize"), 11).toInt(), 8, 20));
+    decoderFont.setWeight(QFont::Normal);
+    decoderFont.setStyleHint(QFont::Monospace);
+    decoder_->setFont(decoderFont);
+    connect(clearRx, &QPushButton::clicked, decoder_, &QPlainTextEdit::clear);
+    layout->addWidget(decoder_, 1);
+
+    // Diagnostics are retained without stealing the decoder's vertical space.
+    audioLabel_ = new QLabel(QStringLiteral("RX audio: no frames"), central);
+    scopeLabel_ = new QLabel(QStringLiteral("MARK —  SPACE —  Quality —  Gate —"), central);
+    audioLabel_->hide();
+    scopeLabel_->hide();
+
+    // Normal ADIF and contest logging use independent persistence.
+    auto *qsoRow = new QHBoxLayout();
+    qsoRow->setSpacing(6);
+    auto qsoField = [central, qsoRow](const QString &label, int width,
+                                      const QString &initial = QString()) {
+        qsoRow->addWidget(new QLabel(label, central));
+        auto *edit = new QLineEdit(central);
+        edit->setFixedWidth(width);
+        edit->setText(initial);
+        qsoRow->addWidget(edit);
+        return edit;
+    };
+    qsoCall_ = qsoField(QStringLiteral("CALL"), 125);
+    qsoName_ = qsoField(QStringLiteral("NAME"), 125);
+    qsoSent_ = qsoField(QStringLiteral("S"), 50, QStringLiteral("599"));
+    qsoReceived_ = qsoField(QStringLiteral("R"), 50, QStringLiteral("599"));
+    // Contest-only QSO fields form one unit so their labels disappear too.
+    auto *contestFields = new QWidget(central);
+    auto *contestFieldsLayout = new QHBoxLayout(contestFields);
+    contestFieldsLayout->setContentsMargins(0, 0, 0, 0);
+    contestFieldsLayout->setSpacing(5);
+    contestFieldsLayout->addWidget(new QLabel(QStringLiteral("EXCH"), contestFields));
+    contestExchange_ = new QLineEdit(contestFields);
+    contestExchange_->setFixedWidth(75);
+    contestFieldsLayout->addWidget(contestExchange_);
+    contestSerial_ = new QSpinBox(central);
+    contestSerial_->setRange(1, 99999);
+    contestSerial_->setValue(QSettings().value(QStringLiteral("contest/cqwwZone"),
+        QSettings().value(QStringLiteral("contest/serial"), 14)).toInt());
+    contestFieldsLayout->addWidget(new QLabel(QStringLiteral("NR"), contestFields));
+    contestSerial_->setFixedWidth(72);
+    contestFieldsLayout->addWidget(contestSerial_);
+    dupeLabel_ = new QLabel(contestFields);
+    contestFieldsLayout->addWidget(dupeLabel_);
+    contestFields->setObjectName(QStringLiteral("contestFields"));
+    connect(exportContest, &QPushButton::clicked, this, [this] { showContestLog(); });
+    connect(contestMode_, &QCheckBox::toggled, this, [this](bool enabled) {
+        QSettings().setValue(QStringLiteral("contest/enabled"), enabled);
+        updateContestUi();
+        refreshMacroButtons();
+    });
+    connect(contestType_, &QComboBox::currentTextChanged, this, [this](const QString &type) {
+        QSettings().setValue(QStringLiteral("contest/type"), type);
+        // Restore each contest's independent outgoing exchange on selection.
+        const bool cqww = type == QStringLiteral("CQ-WW-RTTY");
+        QSettings settings;
+        const QSignalBlocker blocker(contestSerial_);
+        contestSerial_->setMaximum(cqww ? 40 : 99999);
+        contestSerial_->setValue(settings.value(cqww ? QStringLiteral("contest/cqwwZone")
+            : (type == QStringLiteral("DARC-RTTY") ? QStringLiteral("contest/darcSerial") : QStringLiteral("contest/sartgSerial")), cqww ? 14 : 1).toInt());
+        updateContestUi();
+        refreshMacroButtons();
+    });
+    connect(contestSerial_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int serial) {
+        QSettings().setValue(contestType_->currentText() == QStringLiteral("CQ-WW-RTTY")
+            ? QStringLiteral("contest/cqwwZone") : (contestType_->currentText() == QStringLiteral("DARC-RTTY")
+                ? QStringLiteral("contest/darcSerial") : QStringLiteral("contest/sartgSerial")), serial);
+    });
+    connect(qsoCall_, &QLineEdit::textChanged, this, [this] { updateContestUi(); });
+    exportContest->setObjectName(QStringLiteral("contestExport"));
+    contestType_->setObjectName(QStringLiteral("contestType"));
+    contestExchange_->setObjectName(QStringLiteral("contestExchange"));
+    contestSerial_->setObjectName(QStringLiteral("contestSerial"));
+    // Apply the persisted exchange of the initially selected contest too.
+    {
+        const bool cqww = contestType_->currentText() == QStringLiteral("CQ-WW-RTTY");
+        const QSignalBlocker blocker(contestSerial_);
+        contestSerial_->setMaximum(cqww ? 40 : 99999);
+        contestSerial_->setValue(QSettings().value(cqww ? QStringLiteral("contest/cqwwZone")
+            : (contestType_->currentText() == QStringLiteral("DARC-RTTY") ? QStringLiteral("contest/darcSerial") : QStringLiteral("contest/sartgSerial")), cqww ? 14 : 1).toInt());
+    }
+    updateContestUi();
+    qsoCall_->installEventFilter(this);
+    qsoName_->installEventFilter(this);
+    // Keep keyboard QSO entry and decoder double-click targeting in sync.
+    connect(qsoCall_, &QLineEdit::returnPressed, this, [this] {
+        decodePickTarget_ = DecodePickTarget::Name;
+        qsoName_->setFocus();
+    });
+    connect(qsoName_, &QLineEdit::returnPressed, this, [this] {
+        qsoReceived_->setFocus();
+        qsoReceived_->selectAll();
+    });
+    decodeView->onPicked = [this](const QString &token) {
+        if (decodePickTarget_ == DecodePickTarget::Name) {
+            qsoName_->setText(token.toUpper());
+            qsoName_->setFocus();
+        } else {
+            qsoCall_->setText(token.toUpper());
+            decodePickTarget_ = DecodePickTarget::Name;
+            qsoName_->setFocus();
+        }
+    };
+    connect(qsoCall_, &QLineEdit::textEdited, this, [this](const QString &text) {
+        const int position = qsoCall_->cursorPosition();
+        qsoCall_->setText(text.toUpper());
+        qsoCall_->setCursorPosition(position);
+    });
+    auto *newQso = new QPushButton(QStringLiteral("New QSO"), central);
+    connect(newQso, &QPushButton::clicked, this, [this] {
+        qsoCall_->clear();
+        qsoName_->clear();
+        qsoReceived_->setText(QStringLiteral("599"));
+        contestExchange_->clear();
+        decodePickTarget_ = DecodePickTarget::Call;
+        qsoCall_->setFocus();
+    });
+    qsoRow->addWidget(newQso);
+    auto *logQso = new QPushButton(QStringLiteral("Log"), central);
+    logQso->setToolTip(QStringLiteral("Review and save QSO to ~/Documents/rttyPad/rttyPad.adi"));
+    connect(logQso, &QPushButton::clicked, this, [this] {
+        if (contestMode_->isChecked()) logContestQso();
+        else logQsoAdif();
+    });
+    qsoRow->addWidget(logQso);
+    qsoRow->addWidget(contestFields);
+    qsoRow->addStretch(1);
+    layout->addLayout(qsoRow);
+
+    // TX: a single compact status/control strip and a full-width text editor.
+    auto *txButtons = new QHBoxLayout();
+    txButtons->setSpacing(6);
+    txButtons->addWidget(new QLabel(QStringLiteral("TX"), central));
+    txStatus_ = new QLabel(QStringLiteral("Disconnected"), central);
+    txStatus_->setMinimumWidth(150);
+    txButtons->addWidget(txStatus_);
+    sendButton_ = new QPushButton(QStringLiteral("TX ON"), central);
+    drainButton_ = new QPushButton(QStringLiteral("Drain / RX"), central);
+    stopButton_ = new QPushButton(QStringLiteral("TX OFF"), central);
+    auto *clearTx = new QPushButton(QStringLiteral("Clear"), central);
+    txButtons->addWidget(new QLabel(QStringLiteral("Fill"), central));
+    txFill_ = new QComboBox(central);
+    txFill_->addItems({QStringLiteral("MARK"), QStringLiteral("SPACE"), QStringLiteral("LTRS")});
+    txFill_->setCurrentText(QSettings().value(QStringLiteral("tx/fill"), QStringLiteral("LTRS")).toString());
+    txFill_->setFixedWidth(85);
+    txButtons->addWidget(txFill_);
+    txButtons->addWidget(new QLabel(QStringLiteral("Stop"), central));
+    txStopBits_ = new QComboBox(central);
+    txStopBits_->addItems({QStringLiteral("1"), QStringLiteral("1.5"), QStringLiteral("2")});
+    txStopBits_->setCurrentText(QSettings().value(QStringLiteral("tx/stopBits"), QStringLiteral("1.5")).toString());
+    txStopBits_->setFixedWidth(65);
+    txButtons->addWidget(txStopBits_);
+    txUos_ = new QCheckBox(QStringLiteral("UOS"), central);
+    txUos_->setChecked(QSettings().value(QStringLiteral("tx/uos"), true).toBool());
+    txButtons->addWidget(txUos_);
+    txStartCrlf_ = new QCheckBox(QStringLiteral("Start CR/LF"), central);
+    txStartCrlf_->setChecked(QSettings().value(QStringLiteral("tx/startCrlf"), true).toBool());
+    txButtons->addWidget(txStartCrlf_);
+    txButtons->addStretch(1);
+    txButtons->addWidget(drainButton_);
+    txButtons->addWidget(clearTx);
+    txButtons->addWidget(sendButton_);
+    txButtons->addWidget(stopButton_);
+    layout->addLayout(txButtons);
+    // Native FSK is generated inside deskHPSDR. AppKit's TX gain, BPF
+    // and shaping controls belong to its separate AFSK audio path.
+    connect(txFill_, &QComboBox::currentTextChanged, this, [this](const QString &) { sendNativeTxParameters(); });
+    connect(txStopBits_, &QComboBox::currentTextChanged, this, [this](const QString &) { sendNativeTxParameters(); });
+    connect(txUos_, &QCheckBox::toggled, this, [this](bool) { sendNativeTxParameters(); });
+    connect(txStartCrlf_, &QCheckBox::toggled, this, [this](bool) { sendNativeTxParameters(); });
+    connect(idleTimeout_, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this](int) { sendNativeTxParameters(); });
+
+    txInput_ = new QPlainTextEdit(central);
+    txInput_->setPlaceholderText(QStringLiteral("Enter RTTY text to transmit"));
+    txInput_->setFixedHeight(52);
+    txInput_->setStyleSheet(QStringLiteral("QPlainTextEdit { background: #0e0e0e; color: #e0e0e0; border: 0; }"));
+    txInput_->setFont(QFont(QStringLiteral("Menlo"), 14));
+    connect(clearTx, &QPushButton::clicked, txInput_, &QPlainTextEdit::clear);
+    layout->addWidget(txInput_);
+    // AppKit echoes outgoing text into the decoded traffic pane, not a
+    // separate widget below the TX editor.
+    auto *macroRow = new QHBoxLayout();
+    macroRow->setSpacing(6);
+    for (int i = 0; i < 8; ++i) {
+        auto *button = new QPushButton(central);
+        macroButtons_[i] = button;
+        // F1–F8 activate the corresponding macro without moving focus away
+        // from the decoder or QSO entry fields.
+        button->setShortcut(QKeySequence(Qt::Key_F1 + i));
+        button->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(button, &QPushButton::clicked, this, [this, i] { runMacro(i); });
+        connect(button, &QPushButton::customContextMenuRequested, this, [this, i](const QPoint &) { editMacro(i); });
+        button->setFixedHeight(28);
+        macroRow->addWidget(button, 1);
+    }
+    layout->addLayout(macroRow);
+    refreshMacroButtons();
+    connect(sendButton_, &QPushButton::clicked, this, [this] {
+        const QString message = txInput_->toPlainText();
+        if (tx_.send(message)) {
+            appendTxTraffic(message);
+            txInput_->clear();
+        }
+        updateTxUi();
+    });
+    connect(drainButton_, &QPushButton::clicked, this, [this] {
+        tx_.drain();
+        updateTxUi();
+    });
+    connect(stopButton_, &QPushButton::clicked, this, [this] {
+        tx_.stop();
+        updateTxUi();
+    });
+    connect(&tx_, &NativeRTTYTx::stateChanged, this, [this](NativeRTTYTx::State) {
+        updateTxUi();
+    });
+    updateTxUi();
+    RTTY_RX_CONFIG cfg{};
+    cfg.samplerate = 48000.0;
+    cfg.baud = baud_->value();
+    cfg.center_hz = rxCenterHz();
+    cfg.shift_hz = shift_->value();
+    cfg.reverse = rxReverse() ? 1 : 0;
+    rx_ = rtty_rx_create(&cfg);
+    configureRx();
+    connect(center_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this] { configureRx(); });
+    connect(reverse_, &QCheckBox::toggled, this, [this] { configureRx(); });
+    connect(shift_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this] { configureRx(); sendNativeTxParameters(); });
+    connect(baud_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this] { configureRx(); sendNativeTxParameters(); });
+    connect(sql_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this] { configureRx(); });
+    auto *scopeTimer = new QTimer(this);
+    connect(scopeTimer, &QTimer::timeout, this, [this] { updateScope(); });
+    scopeTimer->start(100);
+    setCentralWidget(central);
+    statusBar()->showMessage(QStringLiteral("TCI disconnected — RTTY RX active when audio arrives"));
+
+    connect(connectButton_, &QPushButton::clicked, this, [this] {
+        if (tci_.isConnected()) {
+            disconnectRestoringSession();
+            return;
+        }
+        bool ok = false;
+        const uint port = port_->text().toUInt(&ok);
+        if (!ok || port < 1 || port > 65535 || host_->text().trimmed().isEmpty()) {
+            statusBar()->showMessage(QStringLiteral("Invalid TCI host or port"));
+            return;
+        }
+        QSettings settings;
+        settings.setValue(QStringLiteral("tci/host"), host_->text().trimmed());
+        settings.setValue(QStringLiteral("tci/port"), port);
+        connectionLabel_->setText(QStringLiteral("Connecting…"));
+        tci_.connectToHost(host_->text().trimmed(), quint16(port));
+    });
+    connect(&tci_, &TCIClient::connected, this, [this] {
+        nativeRttyConfirmed_ = false;
+        nativeRttyCheckPending_ = true;
+        tx_.setNativeRttyConfirmed(false);
+        updateConnectionUi(true);
+        sendNativeTxParameters();
+        // The TCI client sends rtty_enable:1 after emitting connected().
+        // Never change the SDR mode/offsets or enable TX before confirmation.
+        const quint64 checkGeneration = ++nativeRttyCheckGeneration_;
+        QTimer::singleShot(2000, this, [this, checkGeneration] {
+            if (checkGeneration == nativeRttyCheckGeneration_ && nativeRttyCheckPending_)
+                failNativeRttyCheck();
+        });
+        if (QSettings().value(QStringLiteral("rx/show_smeter"), false).toBool())
+            tci_.sendText(QStringLiteral("rx_sensors_enable:true,500;"));
+    });
+    connect(&tci_, &TCIClient::disconnected, this, [this](const QString &error) {
+        ++sessionGeneration_;
+        ++nativeRttyCheckGeneration_;
+        nativeRttyCheckPending_ = false;
+        nativeRttyConfirmed_ = false;
+        tx_.setNativeRttyConfirmed(false);
+        sessionRestoring_ = false;
+        updateConnectionUi(false);
+        log_->appendPlainText(QStringLiteral("TCI disconnected: %1").arg(error));
+        if (closingAfterRestore_) QTimer::singleShot(0, this, [this] { close(); });
+    });
+    connect(&tci_, &TCIClient::logLine, this, [this](const QString &line) {
+        log_->appendPlainText(line);
+    });
+    connect(&tci_, &TCIClient::textMessageReceived, this, [this](const QString &message) {
+        log_->appendPlainText(QStringLiteral("RX TEXT: %1").arg(message));
+        // A single WebSocket text frame can contain several TCI commands.
+        // Process native-RTTY capability before allowing any session setup.
+        for (const QString &part : message.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
+            const QString command = part.trimmed();
+            if (command.startsWith(QStringLiteral("RTTY_ENABLE:"), Qt::CaseInsensitive)) {
+                const QString value = command.mid(command.indexOf(QLatin1Char(':')) + 1).trimmed();
+                if (nativeRttyCheckPending_ && value == QStringLiteral("1")) {
+                    nativeRttyCheckPending_ = false;
+                    nativeRttyConfirmed_ = true;
+                    tx_.setNativeRttyConfirmed(true);
+                    beginRttySession();
+                    updateConnectionUi(true);
+                    updateTxUi();
+                } else if (nativeRttyCheckPending_ && value == QStringLiteral("0")) {
+                    failNativeRttyCheck();
+                    return;
+                }
+            }
+        }
+        processTciParameters(message);
+    });
+    connect(&tci_, &TCIClient::rxAudioFrameReceived, this,
+            [this](const QByteArray &data, const TCIStreamInfo &info) {
+        processRxAudio(data, info);
+        ++rxFrames_;
+        if (rxFrames_ % 20 == 1) {
+            audioLabel_->setText(QStringLiteral("RX audio: %1 frames | %2 Hz | %3 ch | peak %4")
+                                     .arg(rxFrames_).arg(info.sampleRate).arg(info.channels)
+                                     .arg(info.peakLeft, 0, 'f', 3));
+        }
+    });
+}
+
+MainWindow::~MainWindow()
+{
+    rtty_rx_destroy(rx_);
+}
+
+void MainWindow::processRxAudio(const QByteArray &data, const TCIStreamInfo &info)
+{
+    if (!rx_ || !info.isRxAudioFloat32 || info.sampleRate < 8000 ||
+        info.channels == 0 || info.channels > 8 || info.audioFrames == 0 ||
+        info.audioFrames > 65536 || info.payloadLength < 0)
+        return;
+
+    const quint64 needed = quint64(info.audioFrames) * info.channels * sizeof(float);
+    if (needed > quint64(info.payloadLength) ||
+        quint64(data.size()) < quint64(info.payloadOffset) + needed)
+        return;
+
+    if (rxSampleRate_ != info.sampleRate) {
+        rxSampleRate_ = info.sampleRate;
+        configureRx();
+    }
+
+    samples_.resize(info.audioFrames);
+    const char *payload = data.constData() + info.payloadOffset;
+    for (quint32 i = 0; i < info.audioFrames; ++i) {
+        float value;
+        std::memcpy(&value, payload + size_t(i) * info.channels * sizeof(float), sizeof(float));
+        samples_[i] = std::isfinite(value) ? value : 0.0f;
+    }
+    RTTY_RX_SCOPE scope{};
+    char decoded[512]{};
+    const int count = rtty_rx_process(rx_, samples_.data(), samples_.size(), decoded, sizeof(decoded));
+    rtty_rx_get_scope(rx_, &scope);
+    // The waterfall uses the MARK/SPACE pitch, not the decoder center frequency.
+    // Keep its carrier gating identical to the AppKit implementation.
+    scopeWidget_->updateWaterfall(samples_.data(), samples_.size(), info.sampleRate,
+                                  center_->value(), shift_->value(),
+                                  tciMode_ == QStringLiteral("DIGU"), scope.carrier != 0);
+    scopeWidget_->updateSample(scope);
+    updateTuningIndicators(scope);
+    updateAfc(samples_.data(), samples_.size(), info.sampleRate, scope.carrier != 0);
+    // AppKit Strict Lock: six consecutive open-gate blocks, followed by
+    // RYRY or eight plausible printable characters before displaying text.
+    bool outputCarrier = scope.carrier != 0;
+    if (strictLock_ && strictLock_->isChecked()) {
+        strictGateBlocks_ = scope.gate_open ? std::min(strictGateBlocks_ + 1, 1000) : 0;
+        outputCarrier = strictGateBlocks_ >= 6;
+    } else {
+        strictGateBlocks_ = 0;
+    }
+    if (!outputCarrier) {
+        if (++noCarrierBlocks_ >= 50) {
+            noCarrierBlocks_ = 0;
+            decodedLocked_ = false;
+            pendingDecoded_.clear();
+        }
+        return;
+    }
+    noCarrierBlocks_ = 0;
+    if (count <= 0) return;
+    QString decodedText = QString::fromLatin1(decoded, count);
+    if (strictLock_ && strictLock_->isChecked() && !decodedLocked_) {
+        pendingDecoded_ += decodedText;
+        if (pendingDecoded_.size() > 256) pendingDecoded_ = pendingDecoded_.right(256);
+        const qsizetype ry = pendingDecoded_.indexOf(QStringLiteral("RYRY"));
+        if (ry >= 0) {
+            decodedText = pendingDecoded_.mid(ry);
+        } else {
+            qsizetype plausible = 0;
+            for (qsizetype i = pendingDecoded_.size(); i > 0; --i) {
+                const QChar ch = pendingDecoded_.at(i - 1);
+                const ushort c = ch.unicode();
+                const bool allowed = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                    QStringLiteral(" \r\n.,?!/-+=:;'\"()&$").contains(ch);
+                if (!allowed) break;
+                ++plausible;
+            }
+            if (plausible < 8) return;
+            decodedText = pendingDecoded_.right(plausible);
+        }
+        pendingDecoded_.clear();
+        decodedLocked_ = true;
+    }
+    QTextCursor cursor = decoder_->textCursor();
+    cursor.movePosition(QTextCursor::End);
+    // Never inherit the preceding TX character format. A QTextCursor at the
+    // end of a document otherwise continues using the last inserted color.
+    QTextCharFormat rxFormat;
+    rxFormat.setForeground(QColor(QStringLiteral("#e0e0e0")));
+    cursor.insertText(decodedText, rxFormat);
+    txEchoLineActive_ = false;
+    decoder_->setTextCursor(cursor);
+    decoder_->ensureCursorVisible();
+}
+
+void MainWindow::appendTxTraffic(const QString &text)
+{
+    if (text.isEmpty() || !decoder_) return;
+    QTextCursor cursor = decoder_->textCursor();
+    cursor.movePosition(QTextCursor::End);
+    QTextCharFormat format;
+    format.setForeground(QColor(QStringLiteral("#66ccff")));
+    if (!txEchoLineActive_) {
+        const QString existing = decoder_->toPlainText();
+        if (!existing.isEmpty() && !existing.endsWith(QLatin1Char('\n')))
+            cursor.insertText(QStringLiteral("\n"), format);
+        cursor.insertText(QStringLiteral("TX: "), format);
+        txEchoLineActive_ = true;
+    }
+    cursor.insertText(text, format);
+    decoder_->setTextCursor(cursor);
+    decoder_->ensureCursorVisible();
+}
+
+void MainWindow::updateConnectionUi(bool connected)
+{
+    if (!connected) {
+        rxSampleRate_ = 0;
+        tciFrequencyHz_ = 0.0;
+        tciRxDbmValid_ = false;
+        updateRxStatus();
+        if (rx_) rtty_rx_reset(rx_);
+        strictGateBlocks_ = 0;
+        noCarrierBlocks_ = 0;
+        decodedLocked_ = false;
+        pendingDecoded_.clear();
+        rxFrames_ = 0;
+        audioLabel_->setText(QStringLiteral("RX audio: no frames"));
+        scopeLabel_->setText(QStringLiteral("MARK —  SPACE —  Quality —  Gate —"));
+        scopeWidget_->clear();
+        afcValid_ = false;
+        afcErrorHz_ = 0.0;
+        afcLabel_->setText(QStringLiteral("AFC -- Hz"));
+        afcLabel_->setStyleSheet(QString());
+        markLed_->setStyleSheet(QStringLiteral("color: #45565c; font-weight: bold;"));
+        spaceLed_->setStyleSheet(QStringLiteral("color: #45565c; font-weight: bold;"));
+    }
+    connectButton_->setText(connected ? QStringLiteral("Disconnect") : QStringLiteral("Connect"));
+    connectionLabel_->setText(connected ? (nativeRttyConfirmed_ ? QStringLiteral("Connected") : QStringLiteral("Checking native RTTY…")) : QStringLiteral("Disconnected"));
+    setWindowTitle(QStringLiteral("rttyPad for deskHPSDR by DL1BZ — %1 offset %2 Hz — %3")
+                       .arg(tciMode_)
+                       .arg(center_->value(), 0, 'f', 0)
+                       .arg(connected ? QStringLiteral("Connected (Native RTTY)")
+                                      : QStringLiteral("Disconnected")));
+    host_->setEnabled(!connected);
+    port_->setEnabled(!connected);
+    statusBar()->showMessage(connected ? (nativeRttyConfirmed_ ? QStringLiteral("Native RTTY confirmed") : QStringLiteral("Checking native RTTY support…"))
+                                       : QStringLiteral("TCI disconnected — RTTY RX active when audio arrives"));
+}
+
+void MainWindow::configureRx()
+{
+    if (!rx_) return;
+    RTTY_RX_CONFIG cfg{};
+    cfg.samplerate = rxSampleRate_ ? rxSampleRate_ : 48000.0;
+    cfg.baud = baud_->value();
+    cfg.center_hz = rxCenterHz();
+    cfg.shift_hz = shift_->value();
+    cfg.reverse = rxReverse() ? 1 : 0;
+    cfg.sql_open = float(sql_->value());
+    cfg.sql_close = cfg.sql_open * 0.5f;
+    rtty_rx_configure(rx_, &cfg);
+    // A new tuning or sample rate invalidates the previous XY trace.
+    if (scopeWidget_) scopeWidget_->clear();
+    QSettings settings;
+    settings.setValue(QStringLiteral("rx/pitchHz"), center_->value());
+    settings.setValue(QStringLiteral("rx/reverse"), reverse_->isChecked());
+    settings.setValue(QStringLiteral("rx/shiftHz"), shift_->value());
+    settings.setValue(QStringLiteral("rx/baud"), baud_->value());
+    settings.setValue(QStringLiteral("rx/sqlOpen"), sql_->value());
+}
+
+void MainWindow::updateScope()
+{
+    if (!rx_) return;
+    RTTY_RX_SCOPE scope{};
+    rtty_rx_get_scope(rx_, &scope);
+    scopeLabel_->setText(QStringLiteral("MARK %1  SPACE %2  Quality %3  Gate %4")
+        .arg(scope.mark_mag, 0, 'f', 3)
+        .arg(scope.space_mag, 0, 'f', 3)
+        .arg(scope.decision_quality, 0, 'f', 2)
+        .arg(scope.gate_open ? QStringLiteral("OPEN") : QStringLiteral("CLOSED")));
+}
+
+void MainWindow::updateTuningIndicators(const RTTY_RX_SCOPE &scope)
+{
+    const bool carrier = scope.carrier != 0;
+    const double confidence = 0.45 + 0.55 * std::min(1.0, std::fabs(double(scope.soft)));
+    const double activeIntensity = 0.55 + 0.45 * confidence;
+    const bool markActive = scope.bit != 0;
+    auto setLed = [carrier, activeIntensity](QLabel *led, bool active) {
+        const int intensity = carrier ? int(255.0 * (active ? activeIntensity : 0.08)) : 0;
+        led->setStyleSheet(QStringLiteral("color: rgb(0,%1,%2); font-weight: bold;")
+                               .arg(intensity).arg(intensity));
+    };
+    setLed(markLed_, markActive);
+    setLed(spaceLed_, !markActive);
+}
+
+void MainWindow::updateAfc(const float *samples, size_t count, double sampleRate, bool carrier)
+{
+    // Display-only AFC, matching AppKit: never retune the decoder.
+    const double centerHz = rxCenterHz();
+    const double markHz = centerHz - shift_->value() / 2.0;
+    const double spaceHz = centerHz + shift_->value() / 2.0;
+    bool valid = carrier && samples && count && sampleRate > 0.0 && markHz >= 50.0;
+    double errorHz = 0.0;
+    if (valid) {
+        double markLevel = 0.0, spaceLevel = 0.0;
+        const double markPeak = localTonePeak(samples, count, sampleRate, markHz, markLevel);
+        const double spacePeak = localTonePeak(samples, count, sampleRate, spaceHz, spaceLevel);
+        const double total = markLevel + spaceLevel;
+        valid = markPeak > 0.0 && spacePeak > 0.0 && total > 1.0e-12;
+        if (valid)
+            errorHz = ((markPeak - markHz) * markLevel + (spacePeak - spaceHz) * spaceLevel) / total;
+    }
+    if (!valid || !std::isfinite(errorHz)) {
+        afcValid_ = false;
+        afcErrorHz_ *= 0.95;
+        afcLabel_->setText(QStringLiteral("AFC -- Hz"));
+        afcLabel_->setStyleSheet(QString());
+        return;
+    }
+    if (!afcValid_) { afcErrorHz_ = errorHz; afcValid_ = true; }
+    else afcErrorHz_ += 0.06 * (errorHz - afcErrorHz_);
+    double displayHz = std::round(afcErrorHz_ / 2.0) * 2.0;
+    if (std::fabs(displayHz) < 1.0) displayHz = 0.0;
+    afcLabel_->setText(QStringLiteral("AFC %1%2 Hz")
+        .arg(displayHz >= 0.0 ? QStringLiteral("+") : QString())
+        .arg(displayHz, 0, 'f', 0));
+    afcLabel_->setStyleSheet(std::fabs(displayHz) <= 25.0
+        ? QStringLiteral("color: #d6d6d6;") : QStringLiteral("color: #ffb340;"));
+}
+
+void MainWindow::updateTxUi()
+{
+    const auto state = tx_.state();
+    const bool connected = tci_.isConnected() && nativeRttyConfirmed_ && state != NativeRTTYTx::State::Disconnected;
+    const bool draining = state == NativeRTTYTx::State::Draining;
+    sendButton_->setEnabled(connected && !draining);
+    drainButton_->setEnabled(connected && state == NativeRTTYTx::State::Sending);
+    stopButton_->setEnabled(connected && (state == NativeRTTYTx::State::Sending || draining));
+    switch (state) {
+    case NativeRTTYTx::State::Disconnected: txStatus_->setText(QStringLiteral("Disconnected")); break;
+    case NativeRTTYTx::State::Idle: txStatus_->setText(QStringLiteral("Idle")); break;
+    case NativeRTTYTx::State::Sending: txStatus_->setText(QStringLiteral("Sending")); break;
+    case NativeRTTYTx::State::Draining: txStatus_->setText(QStringLiteral("Waiting for RX confirmation")); break;
+    }
+}
+
+namespace {
+// Validate all tokens before any TX action. AppKit treats TX/RX as flags,
+// and LTRS/FIGS as ITA2 control symbols (ignored by native deskHPSDR FSK).
+QString macroSyntaxError(const QString &source)
+{
+    const QRegularExpression tags(QStringLiteral("<([^<>]+)>"));
+    const QStringList allowed = {
+        QStringLiteral("TX"), QStringLiteral("RX"),
+        QStringLiteral("BR"), QStringLiteral("CRLF"),
+        QStringLiteral("LTRS"), QStringLiteral("FIGS"),
+        QStringLiteral("MYCALL"), QStringLiteral("MYNAME"),
+        QStringLiteral("MYQTH"), QStringLiteral("MYLOC"), QStringLiteral("MYDOK"),
+        QStringLiteral("PCALL"), QStringLiteral("PNAME"),
+        QStringLiteral("MYZONE"), QStringLiteral("SERIAL"), QStringLiteral("EXCH"),
+        QStringLiteral("RST"), QStringLiteral("PRST")
+    };
+    auto it = tags.globalMatch(source);
+    int txCount = 0, rxCount = 0;
+    while (it.hasNext()) {
+        const auto match = it.next();
+        const QString name = match.captured(1).trimmed().toUpper();
+        if (!allowed.contains(name))
+            return QStringLiteral("Unsupported token <%1>.").arg(name);
+        if (name == QStringLiteral("TX")) ++txCount;
+        if (name == QStringLiteral("RX")) ++rxCount;
+    }
+    if (txCount > 1 || rxCount > 1)
+        return QStringLiteral("Only one <TX> and one <RX> are permitted.");
+    QString withoutTags = source;
+    withoutTags.remove(tags);
+    if (withoutTags.contains(QLatin1Char('<')) || withoutTags.contains(QLatin1Char('>')))
+        return QStringLiteral("Malformed macro token.");
+    for (const QChar ch : source) {
+        if (ch.unicode() == 0x0e || ch.unicode() == 0x0f)
+            return QStringLiteral("Use <LTRS> or <FIGS> instead of raw shift controls.");
+    }
+    return {};
+}
+
+QString defaultMacroText(int index)
+{
+    static const char *const texts[] = {
+        "<TX>CQ CQ CQ DE <MYCALL> <MYCALL> <MYCALL><BR><RX>",
+        "<TX><PCALL> DE <MYCALL> <RST> <RST><BR><RX>",
+        "<TX>NAME <MYNAME> QTH <MYQTH> LOC <MYLOC><BR><RX>",
+        "<TX>TU 73 DE <MYCALL><BR><RX>",
+        "<TX><MYCALL><BR><RX>",
+        "<TX><RST><BR><RX>",
+        "<TX>QTH <MYQTH><BR><RX>",
+        "<TX>LOC <MYLOC><BR><RX>"
+    };
+    return (index >= 0 && index < 8) ? QLatin1String(texts[index]) : QString();
+}
+}
+
+// Contest macros are separate from the normal-mode macros and from each other.
+QString contestMacroPrefix(const QCheckBox *mode, const QComboBox *type)
+{
+    if (!mode->isChecked()) return QStringLiteral("macros/");
+    return type->currentText() == QStringLiteral("CQ-WW-RTTY")
+        ? QStringLiteral("contest/cqww/macros/")
+        : (type->currentText() == QStringLiteral("DARC-RTTY")
+            ? QStringLiteral("contest/darc/macros/") : QStringLiteral("contest/sartg/macros/"));
+}
+
+QString defaultContestMacroText(int index, bool cqww, bool darc)
+{
+    static const char *const common[] = {
+        "<TX>CQ TEST DE <MYCALL> <MYCALL><BR><RX>",
+        "<TX><PCALL> DE <MYCALL><BR><RX>",
+        "<TX><PCALL> <RST> <EXCH> <EXCH><BR><RX>",
+        "<TX><PCALL> TU <MYCALL><BR><RX>",
+        "<TX>AGN AGN<BR><RX>",
+        "<TX>NR NR?<BR><RX>",
+        "<TX>QRZ DE <MYCALL><BR><RX>",
+        "<TX>TU 73 DE <MYCALL><BR><RX>"
+    };
+    if (darc) return QLatin1String(common[index]);
+    if (cqww && index == 2) return QStringLiteral("<TX><PCALL> <RST> <MYZONE> <MYZONE><BR><RX>");
+    if (cqww && index == 5) return QStringLiteral("<TX>ZONE ZONE?<BR><RX>");
+    if (!cqww && index == 0) return QStringLiteral("<TX>CQ SARTG DE <MYCALL> <MYCALL><BR><RX>");
+    if (!cqww && index == 2) return QStringLiteral("<TX><PCALL> <RST> <SERIAL> <SERIAL><BR><RX>");
+    return QLatin1String(common[index]);
+}
+
+void MainWindow::refreshMacroButtons()
+{
+    QSettings settings;
+    for (int i = 0; i < 8; ++i) {
+        const bool contest = contestMode_->isChecked();
+        const bool cqww = contestType_->currentText() == QStringLiteral("CQ-WW-RTTY");
+        const QString key = contestMacroPrefix(contestMode_, contestType_) + QString::number(i) + QStringLiteral("/label");
+        static const char *const normalTitles[] = {"CQ", "ANS", "INFO", "73", "CALL", "RST", "QTH", "LOC"};
+        static const char *const contestTitles[] = {"CQ", "CALL", "EXCH", "TU", "AGN", "NR?", "QRZ", "73"};
+        const QString fallback = contest ? (cqww && i == 5 ? QStringLiteral("ZONE?") : QLatin1String(contestTitles[i]))
+                                         : QLatin1String(normalTitles[i]);
+        macroButtons_[i]->setText(settings.value(key, fallback).toString());
+        macroButtons_[i]->setToolTip(QStringLiteral("F%1: send macro; right-click to edit").arg(i + 1));
+    }
+}
+
+void MainWindow::editMacro(int index)
+{
+    Q_UNUSED(index);
+    QSettings settings;
+    QDialog dialog(this);
+    const bool contest = contestMode_->isChecked();
+    const bool darc = contest && contestType_->currentText() == QStringLiteral("DARC-RTTY");
+    const bool cqww = contest && contestType_->currentText() == QStringLiteral("CQ-WW-RTTY");
+    dialog.setWindowTitle(contest ? QStringLiteral("%1 Setup").arg(contestType_->currentText())
+                                  : QStringLiteral("Macro Setup — Normal RTTY"));
+    dialog.resize(790, 570);
+    auto *outer = new QVBoxLayout(&dialog);
+    outer->setSpacing(7);
+    if (contest) {
+        outer->addWidget(new QLabel(darc ? QStringLiteral("DARC RTTY Kurzcontest Setup — enter DOK or NM for a non-member.")
+                                         : (cqww ? QStringLiteral("CQ WW RTTY — exchange is RST plus CQ zone.")
+                                                 : QStringLiteral("SARTG RTTY — exchange is RST plus serial number.")), &dialog));
+    }
+    auto *station = new QGroupBox(QStringLiteral("Station Tokens"), &dialog);
+    auto *stationGrid = new QGridLayout(station);
+    const char *stationKeys[] = {"callsign", "name", "locator", "qth"};
+    const char *stationLabels[] = {"CALLSIGN", "NAME", "LOC", "QTH"};
+    QLineEdit *stationEdits[4]{};
+    for (int i = 0; i < 4; ++i) {
+        const int row = i / 2;
+        const int col = (i % 2) * 2;
+        stationGrid->addWidget(new QLabel(QLatin1String(stationLabels[i]), station), row, col);
+        stationEdits[i] = new QLineEdit(settings.value(
+            QStringLiteral("station/%1").arg(QLatin1String(stationKeys[i]))).toString(), station);
+        stationGrid->addWidget(stationEdits[i], row, col + 1);
+    }
+    QLineEdit *dokEdit = nullptr;
+    if (darc) {
+        stationGrid->addWidget(new QLabel(QStringLiteral("DOK"), station), 0, 4);
+        dokEdit = new QLineEdit(settings.value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString(), station);
+        dokEdit->setMaximumWidth(110);
+        stationGrid->addWidget(dokEdit, 0, 5);
+    }
+    auto *showSMeter = new QCheckBox(QStringLiteral("Show S-meter"), station);
+    showSMeter->setChecked(settings.value(QStringLiteral("rx/show_smeter"), false).toBool());
+    stationGrid->addWidget(showSMeter, 1, 4, 1, 2);
+    outer->addWidget(station);
+    auto *content = new QWidget(&dialog);
+    auto *grid = new QGridLayout(content);
+    grid->setContentsMargins(0, 3, 0, 3);
+    grid->setVerticalSpacing(5);
+    grid->addWidget(new QLabel(QStringLiteral("Key"), content), 0, 0);
+    grid->addWidget(new QLabel(QStringLiteral("Button"), content), 0, 1);
+    grid->addWidget(new QLabel(QStringLiteral("Text"), content), 0, 2);
+    QLineEdit *labels[8]{};
+    QLineEdit *texts[8]{};
+    static const char *const defaults[] = {"CQ", "ANS", "INFO", "73", "CALL", "RST", "QTH", "LOC"};
+    for (int i = 0; i < 8; ++i) {
+        const QString base = contestMacroPrefix(contestMode_, contestType_) + QString::number(i) + QLatin1Char('/');
+        grid->addWidget(new QLabel(QStringLiteral("F%1").arg(i + 1), content), i + 1, 0);
+        labels[i] = new QLineEdit(settings.value(base + QStringLiteral("label"),
+            contestMode_->isChecked() ? (contestType_->currentText() == QStringLiteral("CQ-WW-RTTY") && i == 5 ? QStringLiteral("ZONE?") : QStringList{QStringLiteral("CQ"), QStringLiteral("CALL"), QStringLiteral("EXCH"), QStringLiteral("TU"), QStringLiteral("AGN"), QStringLiteral("NR?"), QStringLiteral("QRZ"), QStringLiteral("73")}.at(i)) : QLatin1String(defaults[i])).toString(), content);
+        labels[i]->setMaximumWidth(110);
+        grid->addWidget(labels[i], i + 1, 1);
+        texts[i] = new QLineEdit(settings.value(base + QStringLiteral("text"),
+            contestMode_->isChecked() ? defaultContestMacroText(i, contestType_->currentText() == QStringLiteral("CQ-WW-RTTY"), contestType_->currentText() == QStringLiteral("DARC-RTTY")) : defaultMacroText(i)).toString(), content);
+        grid->addWidget(texts[i], i + 1, 2);
+    }
+    grid->setColumnStretch(2, 1);
+    outer->addWidget(content, 1);
+    outer->addWidget(new QLabel(QStringLiteral(
+        "Tokens: <TX> <RX> <BR>/<CRLF> <MYCALL> <MYNAME> <MYQTH> <MYLOC> "
+        "<PCALL> <PNAME> <RST> <PRST> <MYDOK> <MYZONE> <SERIAL> <EXCH>"), &dialog));
+    auto *actions = new QHBoxLayout();
+    auto *importButton = new QPushButton(QStringLiteral("Import…"), &dialog);
+    auto *exportButton = new QPushButton(QStringLiteral("Export…"), &dialog);
+    actions->addWidget(importButton);
+    actions->addWidget(exportButton);
+    actions->addStretch();
+    outer->addLayout(actions);
+    // Export/import uses the AppKit LABEL=TEXT format. Import is staged in
+    // the editor and only persisted after OK, so Cancel remains safe.
+    connect(importButton, &QPushButton::clicked, &dialog, [&] {
+        const QString path = QFileDialog::getOpenFileName(&dialog, QStringLiteral("Import macro texts"));
+        if (path.isEmpty()) return;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Import failed"), file.errorString());
+            return;
+        }
+        const QString data = QString::fromUtf8(file.readAll());
+        int imported = 0;
+        for (const QString &line : data.split(QLatin1Char('\n'))) {
+            const QString entry = line.trimmed();
+            if (entry.isEmpty() || entry.startsWith(QLatin1Char('#'))) continue;
+            const int equal = entry.indexOf(QLatin1Char('='));
+            if (equal <= 0) continue;
+            const QString label = entry.left(equal).trimmed();
+            const QString body = entry.mid(equal + 1).trimmed();
+            if (label.isEmpty()) continue;
+            for (int i = 0; i < 8; ++i) {
+                if (labels[i]->text().compare(label, Qt::CaseInsensitive) == 0) {
+                    texts[i]->setText(body);
+                    ++imported;
+                    break;
+                }
+            }
+        }
+        QMessageBox::information(&dialog, QStringLiteral("Macro import"),
+            QStringLiteral("Imported %1 macro texts by label.").arg(imported));
+    });
+    connect(exportButton, &QPushButton::clicked, &dialog, [&] {
+        const QString path = QFileDialog::getSaveFileName(&dialog,
+            QStringLiteral("Export macro texts"), QStringLiteral("rtty-macros.txt"));
+        if (path.isEmpty()) return;
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Export failed"), file.errorString());
+            return;
+        }
+        QByteArray data;
+        for (int i = 0; i < 8; ++i) {
+            data += labels[i]->text().trimmed().toUtf8() + '=' + texts[i]->text().toUtf8() + '\n';
+        }
+        if (file.write(data) != data.size() || !file.flush())
+            QMessageBox::warning(&dialog, QStringLiteral("Export failed"), file.errorString());
+    });
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    outer->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+        for (int i = 0; i < 8; ++i) {
+            const QString error = macroSyntaxError(texts[i]->text());
+            if (!error.isEmpty()) {
+                QMessageBox::warning(&dialog, QStringLiteral("Invalid macro F%1").arg(i + 1), error);
+                texts[i]->setFocus();
+                return;
+            }
+            if (labels[i]->text().trimmed().isEmpty()) {
+                QMessageBox::warning(&dialog, QStringLiteral("Invalid macro"),
+                    QStringLiteral("F%1 needs a button label.").arg(i + 1));
+                labels[i]->setFocus();
+                return;
+            }
+        }
+        dialog.accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) return;
+    for (int i = 0; i < 4; ++i)
+        settings.setValue(QStringLiteral("station/%1").arg(QLatin1String(stationKeys[i])),
+            stationEdits[i]->text().trimmed().toUpper());
+    if (dokEdit) settings.setValue(QStringLiteral("contest/dok"),
+                                   dokEdit->text().trimmed().toUpper().isEmpty() ? QStringLiteral("NM") : dokEdit->text().trimmed().toUpper());
+    settings.setValue(QStringLiteral("rx/show_smeter"), showSMeter->isChecked());
+    if (tci_.isConnected()) tci_.sendText(showSMeter->isChecked()
+        ? QStringLiteral("rx_sensors_enable:true,500;") : QStringLiteral("rx_sensors_enable:false;"));
+    if (!showSMeter->isChecked()) tciRxDbmValid_ = false;
+    updateRxStatus();
+    for (int i = 0; i < 8; ++i) {
+        const QString base = contestMacroPrefix(contestMode_, contestType_) + QString::number(i) + QLatin1Char('/');
+        settings.setValue(base + QStringLiteral("label"), labels[i]->text().trimmed());
+        settings.setValue(base + QStringLiteral("text"), texts[i]->text());
+    }
+    refreshMacroButtons();
+}
+
+
+void MainWindow::logQsoAdif()
+{
+    // Capture UTC at the Log click, as in the AppKit application.
+    const QDateTime timestamp = QDateTime::currentDateTimeUtc();
+    const QString utcDate = timestamp.toString(QStringLiteral("yyyyMMdd"));
+    const QString utcTime = timestamp.toString(QStringLiteral("HHmmss"));
+    const QSettings settings;
+    const QString stationCall = settings.value(QStringLiteral("station/callsign")).toString().trimmed().toUpper();
+    const QString myGrid = settings.value(QStringLiteral("station/locator")).toString().trimmed().toUpper();
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Log QSO — %1 %2 UTC").arg(utcDate, utcTime));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout();
+    auto field = [&dialog, form](const QString &label, const QString &value) {
+        auto *edit = new QLineEdit(value, &dialog);
+        form->addRow(label, edit);
+        return edit;
+    };
+    auto *call = field(QStringLiteral("CALL*"), qsoCall_->text());
+    auto *name = field(QStringLiteral("NAME"), qsoName_->text());
+    auto *sent = field(QStringLiteral("RST-S*"), qsoSent_->text());
+    auto *received = field(QStringLiteral("RST-R*"), qsoReceived_->text());
+    auto *frequency = field(QStringLiteral("QRG (MHz)*"),
+        tciFrequencyHz_ > 0.0 ? QString::number(tciFrequencyHz_ / 1e6, 'f', 6) : QString());
+    auto *grid = field(QStringLiteral("LOC"), QString());
+    auto *qth = field(QStringLiteral("QTH"), QString());
+    auto *comment = field(QStringLiteral("COMMENT"), QString());
+    layout->addLayout(form);
+    layout->addWidget(new QLabel(QStringLiteral("Station: %1    MY GRID: %2    MODE: RTTY")
+        .arg(stationCall.isEmpty() ? QStringLiteral("--") : stationCall,
+             myGrid.isEmpty() ? QStringLiteral("--") : myGrid), &dialog));
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
+    // Validate inside the dialog. Invalid input must not discard the QSO
+    // details the operator has already entered.
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+        bool ok = false;
+        const double mhz = frequency->text().trimmed().toDouble(&ok);
+        if (call->text().trimmed().isEmpty() || sent->text().trimmed().isEmpty() ||
+            received->text().trimmed().isEmpty() || stationCall.isEmpty() ||
+            myGrid.isEmpty() || !ok || !std::isfinite(mhz) ||
+            mhz <= 0.0 || mhz > 100000.0) {
+            QMessageBox::warning(&dialog, QStringLiteral("Invalid QSO"),
+                QStringLiteral("CALL, QRG, RST-S, RST-R, MYCALL and MYLOC are required. "
+                               "Correct the fields or cancel the dialog."));
+            return;
+        }
+        dialog.accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    const QString callValue = call->text().trimmed().toUpper();
+    const QString sentValue = sent->text().trimmed().toUpper();
+    const QString receivedValue = received->text().trimmed().toUpper();
+    bool freqOk = false;
+    const double freqMHz = frequency->text().trimmed().toDouble(&freqOk);
+    if (callValue.isEmpty() || sentValue.isEmpty() || receivedValue.isEmpty() ||
+        stationCall.isEmpty() || myGrid.isEmpty() || !freqOk ||
+        !std::isfinite(freqMHz) || freqMHz <= 0.0 || freqMHz > 100000.0) {
+        QMessageBox::warning(this, QStringLiteral("QSO not logged"),
+            QStringLiteral("CALL, QRG, RST-S, RST-R, station callsign and station locator are required. "
+                           "Set MYCALL and MYLOC in Setup."));
+        return;
+    }
+
+    // ADIF field lengths are UTF-8 byte counts, not QString character counts.
+    QByteArray record;
+    auto tag = [&record](const char *name, const QString &value) {
+        const QByteArray bytes = value.trimmed().toUtf8();
+        if (bytes.isEmpty()) return;
+        record += '<';
+        record += name;
+        record += ':';
+        record += QByteArray::number(bytes.size());
+        record += '>';
+        record += bytes;
+    };
+    tag("CALL", callValue);
+    tag("FREQ", QString::number(freqMHz, 'f', 6));
+    tag("MODE", QStringLiteral("RTTY"));
+    tag("QSO_DATE", utcDate);
+    tag("TIME_ON", utcTime);
+    tag("QSO_DATE_OFF", utcDate);
+    tag("TIME_OFF", utcTime);
+    tag("RST_SENT", sentValue);
+    tag("RST_RCVD", receivedValue);
+    tag("STATION_CALLSIGN", stationCall);
+    tag("MY_GRIDSQUARE", myGrid);
+    tag("NAME", name->text().trimmed().toUpper());
+    tag("GRIDSQUARE", grid->text().trimmed().toUpper());
+    tag("QTH", qth->text().trimmed().toUpper());
+    tag("COMMENT", comment->text().trimmed());
+    record += "<EOR>\n";
+
+    QString documents = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    if (documents.isEmpty()) documents = QDir::homePath() + QStringLiteral("/Documents");
+    const QString directory = documents + QStringLiteral("/rttyPad");
+    const QString path = directory + QStringLiteral("/rttyPad.adi");
+    if (!QDir().mkpath(directory)) {
+        QMessageBox::critical(this, QStringLiteral("QSO not logged"),
+                              QStringLiteral("Cannot create log directory: %1").arg(directory));
+        return;
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append)) {
+        QMessageBox::critical(this, QStringLiteral("QSO not logged"), file.errorString());
+        return;
+    }
+    QByteArray output;
+    if (file.size() == 0) {
+        output = "rttyPad ADIF log\n<ADIF_VER:5>3.1.4\n<PROGRAMID:7>rttyPad\n<EOH>\n\n";
+    }
+    output += record;
+    // A short write or failed flush must not leave a partial ADIF record.
+    // Preserve the previous file length so an interrupted append can be
+    // rolled back. Never clear the QSO fields on an I/O failure.
+    const qint64 previousSize = file.size();
+    const qint64 written = file.write(output);
+    const bool flushed = written == output.size() && file.flush();
+    if (!flushed) {
+        const QString error = file.errorString();
+        const bool rolledBack = file.resize(previousSize);
+        file.close();
+        QMessageBox::critical(this, QStringLiteral("QSO not logged"),
+            QStringLiteral("ADIF write failed: %1%2").arg(error,
+                rolledBack ? QString() : QStringLiteral(". Partial record may remain in the log.")));
+        return;
+    }
+    file.close();
+    if (file.error() != QFile::NoError) {
+        QMessageBox::critical(this, QStringLiteral("QSO not logged"), file.errorString());
+        return;
+    }
+    qsoCall_->clear();
+    qsoName_->clear();
+    qsoReceived_->setText(QStringLiteral("599"));
+    decodePickTarget_ = DecodePickTarget::Call;
+    qsoCall_->setFocus();
+    statusBar()->showMessage(QStringLiteral("QSO saved: %1").arg(path), 8000);
+}
+
+void MainWindow::editStationSettings()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Station settings"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout();
+    QSettings settings;
+    const struct { const char *label; const char *key; const char *defaultValue; } fields[] = {
+        {"Callsign:", "station/callsign", ""},
+        {"Name:", "station/name", ""},
+        {"QTH:", "station/qth", ""},
+        {"Locator:", "station/locator", ""},
+        {"RST:", "station/rst", "599"}
+    };
+    QLineEdit *edits[5]{};
+    for (int i = 0; i < 5; ++i) {
+        edits[i] = new QLineEdit(&dialog);
+        edits[i]->setText(settings.value(QLatin1String(fields[i].key),
+                                          QLatin1String(fields[i].defaultValue)).toString());
+        form->addRow(QLatin1String(fields[i].label), edits[i]);
+    }
+    layout->addLayout(form);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+    for (int i = 0; i < 5; ++i) {
+        QString value = edits[i]->text().trimmed();
+        if (i == 0 || i == 3) value = value.toUpper();
+        settings.setValue(QLatin1String(fields[i].key), value);
+    }
+}
+
+void MainWindow::runMacro(int index)
+{
+    if (!tci_.isConnected() || !nativeRttyConfirmed_ || tx_.state() == NativeRTTYTx::State::Draining) return;
+    QSettings settings;
+    const bool contest = contestMode_->isChecked();
+    const bool cqww = contestType_->currentText() == QStringLiteral("CQ-WW-RTTY");
+    const QString macroKey = contestMacroPrefix(contestMode_, contestType_) + QString::number(index) + QStringLiteral("/text");
+    QString body = settings.value(macroKey, contest ? defaultContestMacroText(index, cqww, contestType_->currentText() == QStringLiteral("DARC-RTTY")) : defaultMacroText(index)).toString();
+    if (body.isEmpty()) return;
+    // Reject invalid or unsupported tokens before sending rtty_start.
+    const QString syntaxError = macroSyntaxError(body);
+    if (!syntaxError.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Macro"), syntaxError);
+        return;
+    }
+    // AppKit interprets TX/RX tokens as macro-level flags, independent
+    // of their textual position. Native FSK transmits the expanded text
+    // as one queue item and drains only when <RX> was requested.
+    const QRegularExpression txTag(QStringLiteral("<TX>"), QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpression rxTag(QStringLiteral("<RX>"), QRegularExpression::CaseInsensitiveOption);
+    const bool start = body.contains(txTag);
+    const bool drain = body.contains(rxTag);
+    body.remove(txTag);
+    body.remove(rxTag);
+    // Never send a directed reply without a destination callsign.
+    // A missing <PCALL> previously disappeared silently and could result
+    // in a misleading on-air response.
+    if (body.contains(QStringLiteral("<PCALL>"), Qt::CaseInsensitive) &&
+        qsoCall_->text().trimmed().isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Macro"),
+            QStringLiteral("Enter the other station's CALL before sending this macro."));
+        qsoCall_->setFocus();
+        return;
+    }
+    if (contest && body.contains(QStringLiteral("<MYDOK>"), Qt::CaseInsensitive)) {
+        if (contestType_->currentText() != QStringLiteral("DARC-RTTY")) {
+            QMessageBox::warning(this, QStringLiteral("Macro"), QStringLiteral("<MYDOK> is only available for DARC RTTY."));
+            return;
+        }
+        body.replace(QStringLiteral("<MYDOK>"),
+            settings.value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString().trimmed().toUpper(),
+            Qt::CaseInsensitive);
+    }
+    // Resolve contest exchange before general tokens. CQ WW sends CQ zone,
+    // SARTG sends a three-digit running serial. Neither is the received EXCH.
+    if (contest) {
+        const int number = contestSerial_->value();
+        if (cqww && (number < 1 || number > 40)) {
+            QMessageBox::warning(this, QStringLiteral("CQ WW RTTY"),
+                QStringLiteral("Own CQ zone must be between 1 and 40."));
+            return;
+        }
+        QString exchange = cqww ? QString::number(number)
+                                : QStringLiteral("%1").arg(number, 3, 10, QLatin1Char('0'));
+        if (contestType_->currentText() == QStringLiteral("DARC-RTTY") &&
+            settings.value(QStringLiteral("station/callsign")).toString().trimmed().toUpper().startsWith(QLatin1Char('D')))
+            exchange = settings.value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString().trimmed().toUpper();
+        body.replace(QStringLiteral("<EXCH>"), exchange, Qt::CaseInsensitive);
+        body.replace(QStringLiteral("<MYZONE>"), cqww ? exchange : QString(), Qt::CaseInsensitive);
+        // SERIAL is always the running number; EXCH is the on-air exchange.
+        // In DARC, German operators send DOK/NM, not the serial.
+        body.replace(QStringLiteral("<SERIAL>"), cqww ? QString() :
+            QStringLiteral("%1").arg(number, 3, 10, QLatin1Char('0')), Qt::CaseInsensitive);
+    } else if (body.contains(QRegularExpression(QStringLiteral("<(EXCH|MYZONE|SERIAL)>"), QRegularExpression::CaseInsensitiveOption))) {
+        QMessageBox::warning(this, QStringLiteral("Macro"), QStringLiteral("Contest tokens require Contest Mode."));
+        return;
+    }
+    // AppKit resolves partner and report tokens from the active QSO fields.
+    const struct { const char *token; QString value; } qsoFields[] = {
+        {"PCALL", qsoCall_->text().trimmed().toUpper()},
+        {"PNAME", qsoName_->text().trimmed().toUpper()},
+        {"RST", qsoSent_->text().trimmed().toUpper()},
+        {"PRST", qsoReceived_->text().trimmed().toUpper()}
+    };
+    for (const auto &field : qsoFields) {
+        const QString token = QStringLiteral("<%1>").arg(QLatin1String(field.token));
+        if (field.value.isEmpty()) {
+            // A missing partner call/name must not leave doubled spaces.
+            body.replace(QRegularExpression(QStringLiteral("\\s*%1\\s*").arg(QRegularExpression::escape(token)),
+                QRegularExpression::CaseInsensitiveOption), QStringLiteral(" "));
+        } else {
+            body.replace(token, field.value, Qt::CaseInsensitive);
+        }
+    }
+    body.replace(QRegularExpression(QStringLiteral("<BR>|<CRLF>"), QRegularExpression::CaseInsensitiveOption), QStringLiteral("\r\n"));
+    const struct { const char *token; const char *key; } fields[] = {
+        {"MYCALL", "station/callsign"}, {"MYNAME", "station/name"},
+        {"MYQTH", "station/qth"}, {"MYLOC", "station/locator"}
+    };
+    for (const auto &field : fields) {
+        const QString token = QStringLiteral("<%1>").arg(QLatin1String(field.token));
+        if (!body.contains(token, Qt::CaseInsensitive)) continue;
+        const QString value = settings.value(QLatin1String(field.key)).toString().trimmed();
+        if (value.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("Macro"),
+                QStringLiteral("%1 is not configured. Nothing transmitted.").arg(token));
+            return;
+        }
+        body.replace(token, value, Qt::CaseInsensitive);
+    }
+    // AppKit expands these into ITA2 control bytes. deskHPSDR's native
+    // rtty_text protocol chooses shifts itself, so the bytes are stripped
+    // by NativeRTTYTx::escapePayload(). Preserve them until that boundary.
+    body.replace(QStringLiteral("<LTRS>"), QString(QChar(0x0e)), Qt::CaseInsensitive);
+    body.replace(QStringLiteral("<FIGS>"), QString(QChar(0x0f)), Qt::CaseInsensitive);
+    if (body.contains(QLatin1Char('<')) || body.contains(QLatin1Char('>'))) {
+        QMessageBox::warning(this, QStringLiteral("Macro"),
+            QStringLiteral("Unresolved macro token. Nothing transmitted."));
+        return;
+    }
+    // Do not start RF for a macro containing only ITA2 shift controls.
+    QString printable = body;
+    printable.remove(QChar(0x0e));
+    printable.remove(QChar(0x0f));
+    if (printable.trimmed().isEmpty()) {
+        if (drain && tx_.state() == NativeRTTYTx::State::Sending) tx_.drain();
+        return;
+    }
+    if (start && !tx_.start()) return;
+    if (!body.isEmpty()) {
+        if (!tx_.send(body)) return;
+        appendTxTraffic(printable);
+    }
+    if (drain) tx_.drain();
+    updateTxUi();
+}
+
+// Match the AppKit pitch/shift convention: DIGL MARK at pitch, DIGU SPACE at pitch.
+double MainWindow::rxCenterHz() const
+{
+    return center_->value() + (tciMode_ == QStringLiteral("DIGU") ? -shift_->value() / 2.0 : shift_->value() / 2.0);
+}
+
+bool MainWindow::rxReverse() const
+{
+    return reverse_->isChecked() != (tciMode_ == QStringLiteral("DIGU"));
+}
+
+void MainWindow::applyTciPitch()
+{
+    const double pitch = tciMode_ == QStringLiteral("DIGU") ? diguOffsetHz_ : diglOffsetHz_;
+    if (pitch >= 100.0 && pitch <= 6000.0 && center_->value() != pitch)
+        center_->setValue(pitch);
+    updateRxStatus();
+}
+
+void MainWindow::updateRxStatus()
+{
+    if (!rxStatus_) return;
+    const QString qrg = tciFrequencyHz_ > 0.0
+        ? QString::number(tciFrequencyHz_ / 1e6, 'f', 6) + QStringLiteral(" MHz")
+        : QStringLiteral("—");
+    const QString level = QSettings().value(QStringLiteral("rx/show_smeter"), false).toBool() && tciRxDbmValid_
+        ? QString::number(tciRxDbm_, 'f', 0) + QStringLiteral(" dBm")
+        : QStringLiteral("— dBm");
+    rxStatus_->setText(QStringLiteral("MODE %1  |  QRG %2  |  %3")
+                           .arg(tciMode_, qrg, level));
+    setWindowTitle(QStringLiteral("rttyPad for deskHPSDR by DL1BZ — %1 offset %2 Hz — %3")
+                       .arg(tciMode_)
+                       .arg(center_->value(), 0, 'f', 0)
+                       .arg(tci_.isConnected() ? QStringLiteral("Connected (Native RTTY)")
+                                               : QStringLiteral("Disconnected")));
+}
+
+void MainWindow::failNativeRttyCheck()
+{
+    if (!nativeRttyCheckPending_) return;
+    nativeRttyCheckPending_ = false;
+    ++nativeRttyCheckGeneration_;
+    nativeRttyConfirmed_ = false;
+    tx_.setNativeRttyConfirmed(false);
+    updateTxUi();
+    // No SDR settings have been modified while capability was pending.
+    tci_.disconnectFromHost();
+    QMessageBox::critical(this, QStringLiteral("Native RTTY Not Supported"),
+        QStringLiteral("rttyPad requires deskHPSDR with native RTTY support.\n\n"
+                       "The connected TCI server did not confirm the required native RTTY interface.\n\n"
+                       "Please connect to a compatible version of deskHPSDR."));
+}
+
+void MainWindow::beginRttySession()
+{
+    ++sessionGeneration_;
+    originalMode_.clear();
+    requestedRttyPitchHz_ = center_->value();
+    sessionStarted_ = false;
+    snapshotModeReady_ = snapshotDiglReady_ = snapshotDiguReady_ = false;
+    sessionChangedMode_ = sessionChangedDigl_ = sessionChangedDigu_ = false;
+    sessionRestoring_ = false;
+    // Freeze the preference for this connection; toggling Setup mid-session
+    // must not discard a pending restoration or start an incomplete snapshot.
+    autoSetupSession_ = QSettings().value(QStringLiteral("tci/autoSetupDeskHPSDR"), true).toBool();
+    if (!autoSetupSession_) return;
+    // Do not change the SDR until all three original values have been received.
+    tci_.sendText(QStringLiteral("modulation:0;"));
+    tci_.sendText(QStringLiteral("digl_offset;"));
+    tci_.sendText(QStringLiteral("digu_offset;"));
+    const quint64 generation = sessionGeneration_;
+    QTimer::singleShot(2000, this, [this, generation] {
+        if (generation != sessionGeneration_ || !tci_.isConnected() || sessionRestoring_)
+            return;
+        if (!snapshotModeReady_ || !snapshotDiglReady_ || !snapshotDiguReady_)
+            log_->appendPlainText(QStringLiteral("RTTY session: incomplete TCI snapshot; SDR mode/offset unchanged"));
+    });
+}
+
+void MainWindow::maybeStartRttySession()
+{
+    if (!nativeRttyConfirmed_ || !autoSetupSession_ || !tci_.isConnected() || sessionRestoring_ || sessionStarted_ ||
+        !snapshotModeReady_ || !snapshotDiglReady_ || !snapshotDiguReady_)
+        return;
+    sessionStarted_ = true;
+    sessionChangedMode_ = originalMode_ != QStringLiteral("DIGL");
+    sessionChangedDigl_ = qRound(originalDiglOffsetHz_) != qRound(requestedRttyPitchHz_);
+    if (sessionChangedMode_)
+        tci_.sendText(QStringLiteral("modulation:0,DIGL;"));
+    if (sessionChangedDigl_)
+        tci_.sendText(QStringLiteral("digl_offset:%1;").arg(qRound(requestedRttyPitchHz_)));
+    // The DIGU offset is never modified automatically.
+}
+
+void MainWindow::disconnectRestoringSession()
+{
+    if (!tci_.isConnected()) {
+        tci_.disconnectFromHost();
+        return;
+    }
+    if (sessionRestoring_) return;
+    if (!autoSetupSession_) {
+        ++sessionGeneration_;
+        tci_.disconnectFromHost();
+        return;
+    }
+    sessionRestoring_ = true;
+    const quint64 generation = ++sessionGeneration_;
+    if (sessionChangedDigl_ && snapshotDiglReady_)
+        tci_.sendText(QStringLiteral("digl_offset:%1;").arg(qRound(originalDiglOffsetHz_)));
+    if (sessionChangedDigu_ && snapshotDiguReady_)
+        tci_.sendText(QStringLiteral("digu_offset:%1;").arg(qRound(originalDiguOffsetHz_)));
+    if (sessionChangedMode_ && snapshotModeReady_)
+        tci_.sendText(QStringLiteral("modulation:0,%1;").arg(originalMode_));
+    // Allow queued WebSocket messages to reach the server before closing.
+    // This is best-effort; a network failure cannot guarantee restoration.
+    QTimer::singleShot(400, this, [this, generation] {
+        if (generation == sessionGeneration_) tci_.disconnectFromHost();
+    });
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    if (tci_.isConnected()) {
+        event->ignore();
+        closingAfterRestore_ = true;
+        disconnectRestoringSession();
+        return;
+    }
+    QMainWindow::closeEvent(event);
+}
+
+void MainWindow::processTciParameters(const QString &message)
+{
+    QString line = message.trimmed();
+    if (line.endsWith(QLatin1Char(';'))) line.chop(1);
+    const qsizetype colon = line.indexOf(QLatin1Char(':'));
+    if (colon < 0) return;
+    const QString command = line.left(colon).trimmed().toLower();
+    const QStringList args = line.mid(colon + 1).split(QLatin1Char(','));
+    if (args.isEmpty()) return;
+    bool ok = false;
+    if (command == QStringLiteral("modulation") && args.size() >= 2 &&
+        args.at(0).trimmed() == QStringLiteral("0")) {
+        const QString mode = args.at(1).trimmed().toUpper();
+        if (!snapshotModeReady_ && !sessionRestoring_ && !mode.isEmpty()) {
+            originalMode_ = mode;
+            snapshotModeReady_ = true;
+            maybeStartRttySession();
+        }
+        if ((mode == QStringLiteral("DIGL") || mode == QStringLiteral("DIGU")) && mode != tciMode_) {
+            tciMode_ = mode;
+            applyTciPitch();
+            configureRx();
+        }
+    } else if (command == QStringLiteral("digl_offset") || command == QStringLiteral("digu_offset")) {
+        const double hz = args.at(0).trimmed().toDouble(&ok);
+        // Zero is a valid DIGI offset (for example while the SDR is in LSB).
+        // Do not confuse the value with whether the snapshot was received.
+        if (ok && hz >= 0.0 && hz <= 6000.0) {
+            if (command == QStringLiteral("digl_offset")) {
+                if (!snapshotDiglReady_ && !sessionRestoring_) {
+                    originalDiglOffsetHz_ = hz;
+                    snapshotDiglReady_ = true;
+                }
+                diglOffsetHz_ = hz;
+            } else {
+                if (!snapshotDiguReady_ && !sessionRestoring_) {
+                    originalDiguOffsetHz_ = hz;
+                    snapshotDiguReady_ = true;
+                }
+                diguOffsetHz_ = hz;
+            }
+            maybeStartRttySession();
+            if ((command == QStringLiteral("digl_offset") && tciMode_ == QStringLiteral("DIGL")) ||
+                (command == QStringLiteral("digu_offset") && tciMode_ == QStringLiteral("DIGU")))
+                applyTciPitch();
+        }
+    } else if (command == QStringLiteral("rx_sensors") && args.size() >= 2 &&
+               args.at(0).trimmed() == QStringLiteral("0")) {
+        const double dbm = args.at(1).trimmed().toDouble(&ok);
+        if (ok && dbm > -250.0 && dbm < 100.0) {
+            tciRxDbm_ = dbm;
+            tciRxDbmValid_ = true;
+            updateRxStatus();
+        }
+    } else if (command == QStringLiteral("vfo") || command == QStringLiteral("dds") ||
+               command == QStringLiteral("frequency") || command == QStringLiteral("rx_frequency") ||
+               command == QStringLiteral("tx_frequency")) {
+        // TCI messages may contain receiver/VFO indices before the frequency.
+        for (qsizetype i = args.size(); i-- > 0;) {
+            const double hz = args.at(i).trimmed().toDouble(&ok);
+            if (ok && hz >= 100000.0 && hz <= 10000000000.0) {
+                tciFrequencyHz_ = hz;
+                updateRxStatus();
+                break;
+            }
+        }
+    }
+}
+
+void MainWindow::sendNativeTxParameters()
+{
+    if (!txFill_ || !txStopBits_ || !txUos_ || !txStartCrlf_ || !idleTimeout_)
+        return;
+    QSettings settings;
+    settings.setValue(QStringLiteral("tx/fill"), txFill_->currentText());
+    settings.setValue(QStringLiteral("tx/stopBits"), txStopBits_->currentText());
+    settings.setValue(QStringLiteral("tx/uos"), txUos_->isChecked());
+    settings.setValue(QStringLiteral("tx/startCrlf"), txStartCrlf_->isChecked());
+    settings.setValue(QStringLiteral("tx/idleTimeout"), idleTimeout_->value());
+    if (!tci_.isConnected())
+        return;
+    tci_.sendText(QStringLiteral("rtty_baud:%1;").arg(baud_->value(), 0, 'f', 4));
+    tci_.sendText(QStringLiteral("rtty_shift:%1;").arg(shift_->value(), 0, 'f', 1));
+    tci_.sendText(QStringLiteral("rtty_fill:%1;").arg(txFill_->currentText()));
+    tci_.sendText(QStringLiteral("rtty_stop_bits:%1;").arg(txStopBits_->currentText()));
+    tci_.sendText(QStringLiteral("rtty_uos:%1;").arg(txUos_->isChecked() ? 1 : 0));
+    tci_.sendText(QStringLiteral("rtty_start_crlf:%1;").arg(txStartCrlf_->isChecked() ? 1 : 0));
+    tci_.sendText(QStringLiteral("rtty_idle_timeout:%1;").arg(idleTimeout_->value()));
+}
+
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->type() == QEvent::FocusIn) {
+        if (watched == qsoCall_) decodePickTarget_ = DecodePickTarget::Call;
+        else if (watched == qsoName_) decodePickTarget_ = DecodePickTarget::Name;
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
+// Contest records are tab-separated and intentionally independent of ADIF.
+// A successful QSaveFile::commit() atomically replaces the complete log.
+QString MainWindow::contestLogPath() const
+{
+    QString documents = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    if (documents.isEmpty()) documents = QDir::homePath() + QStringLiteral("/Documents");
+    return documents + QStringLiteral("/rttyPad/contest-qsos.tsv");
+}
+
+QString MainWindow::contestBand() const
+{
+    const double mhz = tciFrequencyHz_ / 1e6;
+    if (contestType_->currentText() == QStringLiteral("DARC-RTTY") &&
+        !(mhz >= 3.5 && mhz <= 3.8) && !(mhz >= 7.0 && mhz <= 7.2)) return QString();
+    if (mhz >= 1.8 && mhz <= 2.0) return QStringLiteral("160M");
+    if (mhz >= 3.5 && mhz <= 4.0) return QStringLiteral("80M");
+    if (mhz >= 7.0 && mhz <= 7.3) return QStringLiteral("40M");
+    if (mhz >= 14.0 && mhz <= 14.35) return QStringLiteral("20M");
+    if (mhz >= 21.0 && mhz <= 21.45) return QStringLiteral("15M");
+    if (mhz >= 28.0 && mhz <= 29.7) return QStringLiteral("10M");
+    return QString();
+}
+
+void MainWindow::updateContestUi()
+{
+    if (!contestMode_) return;
+    const bool enabled = contestMode_->isChecked();
+    contestType_->setVisible(true);
+    contestType_->setEnabled(enabled);
+    if (auto *fields = findChild<QWidget *>(QStringLiteral("contestFields")))
+        fields->setVisible(enabled);
+    if (auto *button = findChild<QPushButton *>(QStringLiteral("contestExport"))) {
+        button->setVisible(true);
+        button->setEnabled(enabled);
+    }
+    dupeLabel_->clear();
+    if (!enabled) return;
+    const bool cqww = contestType_->currentText() == QStringLiteral("CQ-WW-RTTY");
+    const bool darc = contestType_->currentText() == QStringLiteral("DARC-RTTY");
+    contestSerial_->setMaximum(cqww ? 40 : 99999);
+    contestSerial_->setToolTip(cqww ? QStringLiteral("Own CQ zone (1–40), not a running serial")
+                                     : (darc ? QStringLiteral("Next DARC short contest serial number")
+                                             : QStringLiteral("Next SARTG serial number")));
+    const QString call = qsoCall_->text().trimmed().toUpper();
+    const QString band = contestBand();
+    bool duplicate = false;
+    QFile file(contestLogPath());
+    if (!call.isEmpty() && !band.isEmpty() && file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        while (!file.atEnd()) {
+            const QList<QByteArray> fields = file.readLine().trimmed().split('\t');
+            if (fields.size() >= 8 && QString::fromUtf8(fields.at(0)) == contestType_->currentText() &&
+                QString::fromUtf8(fields.at(3)) == band &&
+                QString::fromUtf8(fields.at(4)) == call) { duplicate = true; break; }
+        }
+    }
+    dupeLabel_->setText(duplicate ? QStringLiteral("DUPE") : QStringLiteral(""));
+    dupeLabel_->setStyleSheet(duplicate ? QStringLiteral("color: #ff4040; font-weight: bold;") : QString());
+}
+
+void MainWindow::logContestQso()
+{
+    const QString call = qsoCall_->text().trimmed().toUpper();
+    const QString band = contestBand();
+    const QString exchange = contestExchange_->text().trimmed().toUpper();
+    const bool darc = contestType_->currentText() == QStringLiteral("DARC-RTTY");
+    if (call.isEmpty() || band.isEmpty() || (!darc && exchange.isEmpty()) ||
+        qsoSent_->text().trimmed().isEmpty() || qsoReceived_->text().trimmed().isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Contest QSO"),
+            QStringLiteral("CALL, valid contest band, RST and received exchange are required."));
+        return;
+    }
+    // Normalize the received exchange before persisting it.  The native
+    // AppKit logger applies the same contest-specific numeric constraints.
+    static const QRegularExpression digits(QStringLiteral("^[0-9]+$"));
+    const bool cqww = contestType_->currentText() == QStringLiteral("CQ-WW-RTTY");
+    QString normalizedExchange;
+    if (darc) {
+        // AppKit: German calls require DOK or NM; DX stations send a
+        // numeric serial (empty is logged as 000).
+        if (call.startsWith(QLatin1Char('D'))) {
+            if (exchange.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("DARC RTTY"),
+                    QStringLiteral("German stations require a received DOK or NM."));
+                return;
+            }
+            normalizedExchange = exchange;
+        } else {
+            if (!exchange.isEmpty() && (!digits.match(exchange).hasMatch() || exchange.size() > 3)) {
+                QMessageBox::warning(this, QStringLiteral("DARC RTTY"),
+                    QStringLiteral("DX exchange must be a numeric serial of at most three digits."));
+                return;
+            }
+            normalizedExchange = QStringLiteral("%1").arg(exchange.isEmpty() ? 0 : exchange.toInt(), 3, 10, QLatin1Char('0'));
+        }
+    } else {
+        if (!digits.match(exchange).hasMatch()) {
+            QMessageBox::warning(this, QStringLiteral("Contest QSO"),
+                cqww ? QStringLiteral("CQ WW requires a numeric CQ zone (01–40).")
+                     : QStringLiteral("SARTG requires a numeric serial number."));
+            return;
+        }
+        bool numberOk = false;
+        const int receivedNumber = exchange.toInt(&numberOk);
+        if (!numberOk || receivedNumber < 1 || (cqww && receivedNumber > 40)) {
+            QMessageBox::warning(this, QStringLiteral("Contest QSO"),
+                cqww ? QStringLiteral("Received CQ zone must be between 01 and 40.")
+                     : QStringLiteral("Received serial number must be positive."));
+            return;
+        }
+        normalizedExchange = QStringLiteral("%1").arg(receivedNumber, cqww ? 2 : 3, 10, QLatin1Char('0'));
+    }
+    updateContestUi();
+    if (!dupeLabel_->text().isEmpty() &&
+        QMessageBox::question(this, QStringLiteral("Duplicate QSO"),
+            QStringLiteral("This callsign is already logged on this band. Log again?")) != QMessageBox::Yes) return;
+    const QString path = contestLogPath();
+    if (!QDir().mkpath(QFileInfo(path).absolutePath())) {
+        QMessageBox::critical(this, QStringLiteral("Contest QSO"), QStringLiteral("Cannot create contest log directory."));
+        return;
+    }
+    QByteArray previous;
+    QFile source(path);
+    if (source.exists()) {
+        if (!source.open(QIODevice::ReadOnly)) {
+            QMessageBox::critical(this, QStringLiteral("Contest QSO"), source.errorString());
+            return;
+        }
+        previous = source.readAll();
+        if (source.error() != QFile::NoError) {
+            QMessageBox::critical(this, QStringLiteral("Contest QSO"), source.errorString());
+            return;
+        }
+    }
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QStringList fields = {
+        contestType_->currentText(), now.toString(QStringLiteral("yyyy-MM-dd")),
+        now.toString(QStringLiteral("HHmm")), band, call,
+        QString::number(qRound64(tciFrequencyHz_ / 1000.0)),
+        qsoSent_->text().trimmed(), qsoReceived_->text().trimmed(),
+        normalizedExchange,
+        darc && QSettings().value(QStringLiteral("station/callsign")).toString().trimmed().toUpper().startsWith(QLatin1Char('D'))
+            ? QSettings().value(QStringLiteral("contest/dok"), QStringLiteral("NM")).toString().trimmed().toUpper()
+            : QString::number(contestSerial_->value()),
+        QStringLiteral("DX")
+    };
+    for (const QString &field : fields) {
+        if (field.contains(QLatin1Char('\t')) || field.contains(QLatin1Char('\n')) || field.contains(QLatin1Char('\r'))) {
+            QMessageBox::warning(this, QStringLiteral("Contest QSO"), QStringLiteral("Invalid control character in QSO."));
+            return;
+        }
+    }
+    if (!previous.isEmpty() && !previous.endsWith('\n')) previous += '\n';
+    previous += fields.join(QLatin1Char('\t')).toUtf8() + '\n';
+    QSaveFile output(path);
+    if (!output.open(QIODevice::WriteOnly) || output.write(previous) != previous.size() || !output.commit()) {
+        QMessageBox::critical(this, QStringLiteral("Contest QSO"),
+            QStringLiteral("Contest log could not be saved: %1").arg(output.errorString()));
+        return;
+    }
+    if (contestType_->currentText() != QStringLiteral("CQ-WW-RTTY"))
+        contestSerial_->setValue(contestSerial_->value() + 1);
+    qsoCall_->clear();
+    qsoName_->clear();
+    contestExchange_->clear();
+    qsoReceived_->setText(QStringLiteral("599"));
+    decodePickTarget_ = DecodePickTarget::Call;
+    qsoCall_->setFocus();
+    statusBar()->showMessage(QStringLiteral("Contest QSO saved"), 6000);
+    updateContestUi();
+}
+
+void MainWindow::showContestLog()
+{
+    const QString selectedContest = contestType_->currentText();
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Contest Log — %1").arg(selectedContest));
+    dialog.resize(960, 480);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *table = new QTableWidget(&dialog);
+    table->setColumnCount(10);
+    table->setHorizontalHeaderLabels({QStringLiteral("UTC Date"), QStringLiteral("Time"),
+        QStringLiteral("Call"), QStringLiteral("Band"), QStringLiteral("kHz"),
+        QStringLiteral("Sent"), QStringLiteral("Rcv"), QStringLiteral("Exchange"), QStringLiteral("NR"), QStringLiteral("QTH-R")});
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->verticalHeader()->hide();
+    table->horizontalHeader()->setStretchLastSection(true);
+    layout->addWidget(table);
+    auto *actions = new QHBoxLayout();
+    auto *deleteButton = new QPushButton(QStringLiteral("Delete selected QSO"), &dialog);
+    auto *editQsoButton = new QPushButton(QStringLiteral("Edit QSO…"), &dialog);
+    auto *editLocationButton = new QPushButton(QStringLiteral("Edit QTH-R…"), &dialog);
+    auto *exportButton = new QPushButton(QStringLiteral("Export Cabrillo…"), &dialog);
+    auto *closeButton = new QPushButton(QStringLiteral("Close"), &dialog);
+    actions->addWidget(deleteButton);
+    actions->addWidget(editQsoButton);
+    actions->addWidget(editLocationButton);
+    actions->addWidget(exportButton);
+    actions->addStretch();
+    actions->addWidget(closeButton);
+    layout->addLayout(actions);
+
+    // Keep the original raw records (including other contests) so deleting a
+    // visible QSO never modifies unrelated records or silently normalizes data.
+    QList<QByteArray> records;
+    auto reload = [&]() -> bool {
+        QFile file(contestLogPath());
+        records.clear();
+        table->setRowCount(0);
+        if (!file.exists()) return true;
+        if (!file.open(QIODevice::ReadOnly)) {
+            QMessageBox::critical(&dialog, QStringLiteral("Contest Log"), file.errorString());
+            return false;
+        }
+        while (!file.atEnd()) {
+            QByteArray line = file.readLine();
+            if (line.isEmpty() && file.error() != QFile::NoError) {
+                QMessageBox::critical(&dialog, QStringLiteral("Contest Log"), file.errorString());
+                return false;
+            }
+            const int recordIndex = records.size();
+            records.append(line);
+            const QList<QByteArray> fields = line.trimmed().split('\t');
+            if ((fields.size() != 10 && fields.size() != 11) || QString::fromUtf8(fields.at(0)) != selectedContest) continue;
+            const int row = table->rowCount();
+            table->insertRow(row);
+            const int columns[] = {1, 2, 4, 3, 5, 6, 7, 8, 9};
+            for (int col = 0; col < 10; ++col) {
+                const QString value = col == 9 ? (fields.size() == 11 ? QString::fromUtf8(fields.at(10)) : QStringLiteral("DX"))
+                                                 : QString::fromUtf8(fields.at(columns[col]));
+                auto *item = new QTableWidgetItem(value);
+                if (col == 0) item->setData(Qt::UserRole, recordIndex);
+                table->setItem(row, col, item);
+            }
+        }
+        if (file.error() != QFile::NoError) {
+            QMessageBox::critical(&dialog, QStringLiteral("Contest Log"), file.errorString());
+            return false;
+        }
+        return true;
+    };
+    if (!reload()) return;
+    connect(deleteButton, &QPushButton::clicked, &dialog, [&] {
+        const int row = table->currentRow();
+        if (row < 0 || !table->item(row, 0)) return;
+        const int index = table->item(row, 0)->data(Qt::UserRole).toInt();
+        if (index < 0 || index >= records.size()) return;
+        if (QMessageBox::question(&dialog, QStringLiteral("Delete contest QSO"),
+            QStringLiteral("Permanently delete the selected QSO?")) != QMessageBox::Yes) return;
+        QByteArray updated;
+        for (int i = 0; i < records.size(); ++i) {
+            if (i != index) updated += records.at(i);
+        }
+        QSaveFile output(contestLogPath());
+        if (!output.open(QIODevice::WriteOnly) || output.write(updated) != updated.size() || !output.commit()) {
+            QMessageBox::critical(&dialog, QStringLiteral("Contest Log"), output.errorString());
+            return;
+        }
+        reload();
+        updateContestUi();
+    });
+    connect(editQsoButton, &QPushButton::clicked, &dialog, [&] {
+        const int row = table->currentRow();
+        if (row < 0 || !table->item(row, 0)) return;
+        const int index = table->item(row, 0)->data(Qt::UserRole).toInt();
+        if (index < 0 || index >= records.size()) return;
+        QList<QByteArray> fields = records.at(index).trimmed().split('\t');
+        if ((fields.size() != 10 && fields.size() != 11) ||
+            QString::fromUtf8(fields.at(0)) != selectedContest) return;
+
+        QDialog editor(&dialog);
+        editor.setWindowTitle(QStringLiteral("Edit Contest QSO"));
+        auto *form = new QFormLayout(&editor);
+        auto *call = new QLineEdit(QString::fromUtf8(fields.at(4)), &editor);
+        auto *sentRst = new QLineEdit(QString::fromUtf8(fields.at(6)), &editor);
+        auto *receivedRst = new QLineEdit(QString::fromUtf8(fields.at(7)), &editor);
+        auto *exchange = new QLineEdit(QString::fromUtf8(fields.at(8)), &editor);
+        auto *sentExchange = new QLineEdit(QString::fromUtf8(fields.at(9)), &editor);
+        auto *frequency = new QLineEdit(QString::fromUtf8(fields.at(5)), &editor);
+        form->addRow(QStringLiteral("CALL"), call);
+        form->addRow(QStringLiteral("Frequency (kHz)"), frequency);
+        form->addRow(QStringLiteral("RST sent"), sentRst);
+        form->addRow(QStringLiteral("RST received"), receivedRst);
+        form->addRow(QStringLiteral("Exchange received"), exchange);
+        form->addRow(selectedContest == QStringLiteral("CQ-WW-RTTY")
+                         ? QStringLiteral("Own CQ zone") : (selectedContest == QStringLiteral("DARC-RTTY")
+                             ? QStringLiteral("Exchange sent (DOK/NM or serial)") : QStringLiteral("Serial sent")), sentExchange);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &editor);
+        form->addRow(buttons);
+        connect(buttons, &QDialogButtonBox::rejected, &editor, &QDialog::reject);
+        connect(buttons, &QDialogButtonBox::accepted, &editor, [&] {
+            static const QRegularExpression callPattern(QStringLiteral("^[A-Z0-9/]{3,20}$"));
+            static const QRegularExpression rstPattern(QStringLiteral("^[0-9]{2,3}$"));
+            static const QRegularExpression digits(QStringLiteral("^[0-9]+$"));
+            const QString newCall = call->text().trimmed().toUpper();
+            const QString newSent = sentRst->text().trimmed();
+            const QString newReceived = receivedRst->text().trimmed();
+            const QString newExchange = exchange->text().trimmed();
+            const QString newSentExchange = sentExchange->text().trimmed();
+            bool freqOk = false, rxOk = false, txOk = false;
+            const int khz = frequency->text().trimmed().toInt(&freqOk);
+            const int rx = newExchange.toInt(&rxOk);
+            const int tx = newSentExchange.toInt(&txOk);
+            const bool cqww = selectedContest == QStringLiteral("CQ-WW-RTTY");
+            const bool darc = selectedContest == QStringLiteral("DARC-RTTY");
+            static const QRegularExpression darcExchange(QStringLiteral("^[A-Z0-9]{1,6}$"));
+            const bool validRxExchange = darc ? darcExchange.match(newExchange.toUpper()).hasMatch()
+                                              : digits.match(newExchange).hasMatch() && rxOk && rx >= 1;
+            const bool validTxExchange = darc ? darcExchange.match(newSentExchange.toUpper()).hasMatch()
+                                              : digits.match(newSentExchange).hasMatch() && txOk && tx >= 1;
+            if (!callPattern.match(newCall).hasMatch() ||
+                !rstPattern.match(newSent).hasMatch() || !rstPattern.match(newReceived).hasMatch() ||
+                !validRxExchange || !validTxExchange || !freqOk || khz <= 0 ||
+                (cqww && (rx > 40 || tx > 40))) {
+                QMessageBox::warning(&editor, QStringLiteral("Contest QSO"),
+                    QStringLiteral("Check CALL, frequency, RST and numeric exchanges (CQ zones 1–40)."));
+                return;
+            }
+            fields[4] = newCall.toUtf8();
+            fields[5] = QByteArray::number(khz);
+            fields[6] = newSent.toUtf8();
+            fields[7] = newReceived.toUtf8();
+            fields[8] = darc ? newExchange.toUpper().toUtf8()
+                             : QStringLiteral("%1").arg(rx, cqww ? 2 : 3, 10, QLatin1Char('0')).toUtf8();
+            fields[9] = darc ? newSentExchange.toUpper().toUtf8()
+                             : QStringLiteral("%1").arg(tx, cqww ? 1 : 3, 10, QLatin1Char('0')).toUtf8();
+            QByteArray updated;
+            for (int i = 0; i < records.size(); ++i)
+                updated += i == index ? fields.join('\t') + '\n' : records.at(i);
+            QSaveFile output(contestLogPath());
+            if (!output.open(QIODevice::WriteOnly) || output.write(updated) != updated.size() || !output.commit()) {
+                QMessageBox::critical(&editor, QStringLiteral("Contest Log"), output.errorString());
+                return;
+            }
+            editor.accept();
+        });
+        if (editor.exec() == QDialog::Accepted) {
+            if (reload() && row < table->rowCount()) table->selectRow(row);
+            updateContestUi();
+        }
+    });
+    editLocationButton->setEnabled(selectedContest == QStringLiteral("CQ-WW-RTTY"));
+    connect(editLocationButton, &QPushButton::clicked, &dialog, [&] {
+        const int row = table->currentRow();
+        if (row < 0 || !table->item(row, 0)) return;
+        const int index = table->item(row, 0)->data(Qt::UserRole).toInt();
+        if (index < 0 || index >= records.size()) return;
+        QList<QByteArray> fields = records.at(index).trimmed().split('\t');
+        if ((fields.size() != 10 && fields.size() != 11) ||
+            QString::fromUtf8(fields.at(0)) != QStringLiteral("CQ-WW-RTTY")) return;
+        const QString oldValue = fields.size() == 11 ? QString::fromUtf8(fields.at(10)) : QStringLiteral("DX");
+        bool accepted = false;
+        const QString value = QInputDialog::getText(&dialog, QStringLiteral("Received QTH-R"),
+            QStringLiteral("State/province for continental US/Canada, otherwise DX:"),
+            QLineEdit::Normal, oldValue, &accepted).trimmed().toUpper();
+        if (!accepted) return;
+        if (!validCQWWQthR(value)) {
+            QMessageBox::warning(&dialog, QStringLiteral("QTH-R"), QStringLiteral("Use DX or a valid state/province abbreviation."));
+            return;
+        }
+        if (fields.size() == 10) fields.append(value.toUtf8());
+        else fields[10] = value.toUtf8();
+        QByteArray updated;
+        for (int i = 0; i < records.size(); ++i)
+            updated += i == index ? fields.join('\t') + '\n' : records.at(i);
+        QSaveFile output(contestLogPath());
+        if (!output.open(QIODevice::WriteOnly) || output.write(updated) != updated.size() || !output.commit()) {
+            QMessageBox::critical(&dialog, QStringLiteral("Contest Log"), output.errorString());
+            return;
+        }
+        reload();
+        if (row < table->rowCount()) table->selectRow(row);
+    });
+    connect(exportButton, &QPushButton::clicked, &dialog, [this] { exportContestCabrillo(); });
+    connect(closeButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+    dialog.exec();
+}
+
+void MainWindow::exportContestCabrillo()
+{
+    const QString station = QSettings().value(QStringLiteral("station/callsign")).toString().trimmed().toUpper();
+    if (station.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Cabrillo"), QStringLiteral("Configure MYCALL first."));
+        return;
+    }
+    QFile source(contestLogPath());
+    if (!source.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, QStringLiteral("Cabrillo"), QStringLiteral("No contest log available."));
+        return;
+    }
+    const QString contest = contestType_->currentText();
+    const bool cqww = contest == QStringLiteral("CQ-WW-RTTY");
+    const bool darc = contest == QStringLiteral("DARC-RTTY");
+    QSettings settings;
+    QDialog config(this);
+    config.setWindowTitle(QStringLiteral("Cabrillo Settings"));
+    auto *form = new QFormLayout(&config);
+    auto *power = new QComboBox(&config);
+    power->addItems({QStringLiteral("HIGH"), QStringLiteral("LOW"), QStringLiteral("QRP")});
+    power->setCurrentText(settings.value(QStringLiteral("cabrillo/power"), QStringLiteral("LOW")).toString());
+    auto *operatorCategory = new QComboBox(&config);
+    operatorCategory->addItems({QStringLiteral("SINGLE-OP"), QStringLiteral("CHECKLOG")});
+    operatorCategory->setCurrentText(settings.value(QStringLiteral("cabrillo/operator"), QStringLiteral("SINGLE-OP")).toString());
+    auto *assisted = new QComboBox(&config);
+    assisted->addItems({QStringLiteral("NON-ASSISTED"), QStringLiteral("ASSISTED")});
+    assisted->setCurrentText(settings.value(QStringLiteral("cabrillo/assisted"), QStringLiteral("NON-ASSISTED")).toString());
+    auto *bandCategory = new QComboBox(&config);
+    bandCategory->addItems({QStringLiteral("ALL"), QStringLiteral("80M"), QStringLiteral("40M"),
+                            QStringLiteral("20M"), QStringLiteral("15M"), QStringLiteral("10M")});
+    bandCategory->setCurrentText(settings.value(QStringLiteral("cabrillo/band"), QStringLiteral("ALL")).toString());
+    auto *email = new QLineEdit(settings.value(QStringLiteral("cabrillo/email")).toString(), &config);
+    auto *club = new QLineEdit(settings.value(QStringLiteral("cabrillo/club")).toString(), &config);
+    auto *soapbox = new QLineEdit(settings.value(QStringLiteral("cabrillo/soapbox")).toString(), &config);
+    auto *location = new QLineEdit(settings.value(QStringLiteral("cabrillo/location"), QStringLiteral("DX")).toString(), &config);
+    location->setMaxLength(16);
+    form->addRow(QStringLiteral("Operator"), operatorCategory);
+    form->addRow(QStringLiteral("Power"), power);
+    if (cqww) {
+        form->addRow(QStringLiteral("Location"), location);
+        form->addRow(QStringLiteral("Assisted"), assisted);
+        form->addRow(QStringLiteral("Band"), bandCategory);
+    }
+    form->addRow(QStringLiteral("E-mail"), email);
+    form->addRow(QStringLiteral("Club"), club);
+    form->addRow(QStringLiteral("Soapbox"), soapbox);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &config);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &config, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &config, &QDialog::reject);
+    if (config.exec() != QDialog::Accepted) return;
+    const QString chosenLocation = location->text().trimmed().toUpper();
+    static const QRegularExpression validLocation(QStringLiteral("^[A-Z0-9-]{1,16}$"));
+    if (cqww && !validLocation.match(chosenLocation).hasMatch()) {
+        QMessageBox::warning(this, QStringLiteral("Cabrillo"), QStringLiteral("Invalid LOCATION field."));
+        return;
+    }
+    settings.setValue(QStringLiteral("cabrillo/power"), power->currentText());
+    settings.setValue(QStringLiteral("cabrillo/operator"), operatorCategory->currentText());
+    settings.setValue(QStringLiteral("cabrillo/location"), chosenLocation);
+    settings.setValue(QStringLiteral("cabrillo/assisted"), assisted->currentText());
+    settings.setValue(QStringLiteral("cabrillo/band"), bandCategory->currentText());
+    settings.setValue(QStringLiteral("cabrillo/email"), email->text().trimmed());
+    settings.setValue(QStringLiteral("cabrillo/club"), club->text().trimmed());
+    settings.setValue(QStringLiteral("cabrillo/soapbox"), soapbox->text().trimmed());
+    QStringList lines;
+    lines << QStringLiteral("START-OF-LOG: %1").arg(darc || cqww ? QStringLiteral("3.0") : QStringLiteral("2.0"))
+          << QStringLiteral("CONTEST: %1").arg(cqww ? QStringLiteral("CQ-WW-RTTY") : (darc ? QStringLiteral("ShortRY") : QStringLiteral("SARTG-RTTY")))
+          << QStringLiteral("CALLSIGN: %1").arg(station);
+    if (cqww) {
+        lines << QStringLiteral("LOCATION: %1").arg(chosenLocation)
+              << QStringLiteral("CATEGORY-OPERATOR: %1").arg(operatorCategory->currentText())
+              << QStringLiteral("CATEGORY-BAND: %1").arg(bandCategory->currentText())
+              << QStringLiteral("CATEGORY-POWER: %1").arg(power->currentText())
+              << QStringLiteral("CATEGORY-MODE: RTTY")
+              << QStringLiteral("CATEGORY-ASSISTED: %1").arg(assisted->currentText())
+              << QStringLiteral("CATEGORY-STATION: FIXED");
+    } else if (darc) {
+        lines << QStringLiteral("CATEGORY-OPERATOR: SINGLE-OP")
+              << QStringLiteral("CATEGORY-BAND: ALL")
+              << QStringLiteral("CATEGORY-MODE: RTTY")
+              << QStringLiteral("CATEGORY-POWER: %1").arg(power->currentText())
+              << QStringLiteral("CATEGORY-ASSISTED: NON-ASSISTED")
+              << QStringLiteral("CATEGORY-STATION: FIXED");
+    } else {
+        // SARTG uses the Cabrillo 2.0 category convention in AppKit.
+        lines << QStringLiteral("CATEGORY: %1 ALL %2 RTTY")
+                     .arg(operatorCategory->currentText(), power->currentText());
+    }
+    const QString operatorName = settings.value(QStringLiteral("station/name")).toString().trimmed();
+    if (!operatorName.isEmpty()) lines << QStringLiteral("NAME: %1").arg(operatorName);
+    lines << QStringLiteral("OPERATORS: %1").arg(station)
+          << QStringLiteral("CREATED-BY: rttyPad");
+    if (!email->text().trimmed().isEmpty()) {
+        lines << (cqww ? QStringLiteral("EMAIL: %1") : QStringLiteral("SOAPBOX: E-MAIL: %1"))
+                     .arg(email->text().trimmed());
+    }
+    if (!club->text().trimmed().isEmpty()) lines << QStringLiteral("CLUB: %1").arg(club->text().trimmed());
+    for (const QString &entry : soapbox->text().split(QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts)) {
+        if (!entry.trimmed().isEmpty()) lines << QStringLiteral("SOAPBOX: %1").arg(entry.trimmed());
+    }
+    // Review location codes before exporting.  Zones 03-05 may include
+    // continental USA/Canada, but the zone alone cannot establish the QTH.
+    // Do not silently turn an unrecognized code into a plausible Cabrillo QSO.
+    int missingQthR = 0;
+    int invalidQthR = 0;
+    if (cqww) {
+        while (!source.atEnd()) {
+            const QList<QByteArray> fields = source.readLine().trimmed().split('\t');
+            if ((fields.size() != 10 && fields.size() != 11) ||
+                QString::fromUtf8(fields.at(0)) != contest) continue;
+            const QString qth = fields.size() == 11
+                ? QString::fromUtf8(fields.at(10)).trimmed().toUpper() : QStringLiteral("DX");
+            if (!validCQWWQthR(qth)) ++invalidQthR;
+            else if (qth == QStringLiteral("DX")) {
+                bool ok = false;
+                const int zone = QString::fromUtf8(fields.at(8)).toInt(&ok);
+                if (ok && zone >= 3 && zone <= 5) ++missingQthR;
+            }
+        }
+        if (source.error() != QFile::NoError) {
+            QMessageBox::critical(this, QStringLiteral("Cabrillo"), source.errorString());
+            return;
+        }
+        if (missingQthR || invalidQthR) {
+            const QString warning = QStringLiteral(
+                "%1 QSO(s) in zones 03-05 still have QTH-R DX; "
+                "%2 QSO(s) have an invalid QTH-R.\n\n"
+                "Review the Contest Log before submission. Continue exporting?")
+                .arg(missingQthR).arg(invalidQthR);
+            if (QMessageBox::question(this, QStringLiteral("Review CQ WW QTH-R"), warning,
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+                return;
+        }
+        if (!source.seek(0)) {
+            QMessageBox::critical(this, QStringLiteral("Cabrillo"),
+                QStringLiteral("Cannot rewind contest log for export."));
+            return;
+        }
+    }
+    // A single-band entry must not silently contain contacts from other bands.
+    // Filter by the stored band (field 3), not by the current VFO frequency.
+    const QString requestedBand = cqww ? bandCategory->currentText() : QStringLiteral("ALL");
+    int count = 0;
+    int excluded = 0;
+    int recordNumber = 0;
+    static const QRegularExpression cabrilloDate(QStringLiteral("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"));
+    static const QRegularExpression cabrilloTime(QStringLiteral("^([01][0-9]|2[0-3])[0-5][0-9]$"));
+    static const QRegularExpression cabrilloCall(QStringLiteral("^[A-Z0-9/]+$"));
+    static const QRegularExpression cabrilloDigits(QStringLiteral("^[0-9]+$"));
+    while (!source.atEnd()) {
+        ++recordNumber;
+        const QList<QByteArray> fields = source.readLine().trimmed().split('\t');
+        if (fields.isEmpty() || QString::fromUtf8(fields.at(0)) != contest) continue;
+        if (fields.size() != 10 && fields.size() != 11) {
+            QMessageBox::critical(this, QStringLiteral("Cabrillo"),
+                QStringLiteral("Malformed contest log record on line %1 (%2 fields). Export aborted.")
+                    .arg(recordNumber).arg(fields.size()));
+            return;
+        }
+        if (requestedBand != QStringLiteral("ALL") &&
+            QString::fromUtf8(fields.at(3)).toUpper() != requestedBand) {
+            ++excluded;
+            continue;
+        }
+        const QString rawFrequency = QString::fromUtf8(fields.at(5));
+        const QString rawDate = QString::fromUtf8(fields.at(1));
+        const QString rawTime = QString::fromUtf8(fields.at(2));
+        const QString rawCall = QString::fromUtf8(fields.at(4)).trimmed().toUpper();
+        const QString rawSent = QString::fromUtf8(fields.at(9));
+        const QString rawReceived = QString::fromUtf8(fields.at(8));
+        bool frequencyOk = false;
+        const int khz = rawFrequency.toInt(&frequencyOk);
+        bool sentOk = false, receivedOk = false;
+        const int sentValue = rawSent.toInt(&sentOk);
+        const int receivedValue = rawReceived.toInt(&receivedOk);
+        if (!frequencyOk || khz <= 0 ||
+            !cabrilloDate.match(rawDate).hasMatch() ||
+            !QDate::fromString(rawDate, QStringLiteral("yyyy-MM-dd")).isValid() ||
+            !cabrilloTime.match(rawTime).hasMatch() ||
+            !cabrilloCall.match(rawCall).hasMatch() ||
+            (!darc && !cabrilloDigits.match(rawSent).hasMatch()) ||
+            (!darc && !cabrilloDigits.match(rawReceived).hasMatch()) ||
+            (!darc && (!sentOk || !receivedOk || sentValue <= 0 || receivedValue <= 0)) ||
+            (darc && (rawSent.isEmpty() || rawReceived.isEmpty())) ||
+            (cqww && (sentValue > 40 || receivedValue > 40)) ||
+            (cqww && !validCQWWQthR(QString::fromUtf8(fields.size() == 11 ? fields.at(10) : QByteArray("DX")).trimmed().toUpper()))) {
+            QMessageBox::critical(this, QStringLiteral("Cabrillo"),
+                QStringLiteral("Invalid QSO data on contest log line %1. Correct the QSO before exporting.")
+                    .arg(recordNumber));
+            return;
+        }
+        const QString frequency = QString::fromUtf8(fields.at(5)).rightJustified(5, QLatin1Char(' '));
+        const QString date = QString::fromUtf8(fields.at(1));
+        const QString time = QString::fromUtf8(fields.at(2)).leftJustified(4, QLatin1Char(' '));
+        const QString call = QString::fromUtf8(fields.at(4)).leftJustified(13, QLatin1Char(' '));
+        const QString sentRst = QString::fromUtf8(fields.at(6));
+        const QString receivedRst = QString::fromUtf8(fields.at(7));
+        const QString receivedExchange = QString::fromUtf8(fields.at(8));
+        const QString sentExchange = QString::fromUtf8(fields.at(9));
+        const QString receivedLocation = fields.size() == 11 ? QString::fromUtf8(fields.at(10)) : QStringLiteral("DX");
+        if (cqww) {
+            // CQ WW RTTY: sent RST, zone, DX; received RST, zone, location.
+            // LOCATION: DX in the header is not transmitted as an exchange.
+            lines << QStringLiteral("QSO: %1 RY %2 %3 %4 %5 %6 DX %7 %8 %9 %10")
+                .arg(frequency, date, time, station.leftJustified(13, QLatin1Char(' ')),
+                     sentRst, sentExchange.rightJustified(2, QLatin1Char('0')),
+                     call, receivedRst, receivedExchange.rightJustified(2, QLatin1Char('0')), receivedLocation);
+        } else {
+            lines << QStringLiteral("QSO: %1 RY %2 %3 %4 %5 %6 %7 %8 %9")
+                .arg(frequency, date, time, station.leftJustified(13, QLatin1Char(' ')),
+                     sentRst, (darc ? sentExchange.leftJustified(6, QLatin1Char(' '))
+                                    : sentExchange.rightJustified(6, QLatin1Char(' '))),
+                     call, receivedRst, (darc ? receivedExchange.leftJustified(6, QLatin1Char(' '))
+                                               : receivedExchange.rightJustified(6, QLatin1Char(' '))));
+        }
+        ++count;
+    }
+    if (source.error() != QFile::NoError) {
+        QMessageBox::critical(this, QStringLiteral("Cabrillo"), source.errorString());
+        return;
+    }
+    if (!count) {
+        QMessageBox::warning(this, QStringLiteral("Cabrillo"),
+            excluded ? QStringLiteral("No QSOs on the selected category band.")
+                     : QStringLiteral("No QSOs for the selected contest."));
+        return;
+    }
+    lines << QStringLiteral("END-OF-LOG:");
+    const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export Cabrillo"),
+        station + QStringLiteral(".cbr"), QStringLiteral("Cabrillo (*.cbr)"));
+    if (path.isEmpty()) return;
+    QSaveFile output(path);
+    const QByteArray bytes = (lines.join(QLatin1Char('\n')) + QLatin1Char('\n')).toUtf8();
+    if (!output.open(QIODevice::WriteOnly) || output.write(bytes) != bytes.size() || !output.commit()) {
+        QMessageBox::critical(this, QStringLiteral("Cabrillo"), output.errorString());
+    }
+}

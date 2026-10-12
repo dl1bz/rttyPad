@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file>AppIcon.png</file>
+    <file>CheckboxTick.png</file>
+  </qresource>
+</RCC>
