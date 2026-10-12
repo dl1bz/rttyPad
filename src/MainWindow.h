@@ -47,6 +47,7 @@ private:
   NativeRTTYTx tx_{&tci_};
   void updateTxUi();
   void appendTxTraffic(const QString &text);
+  void appendMonitorLogText(const QString &text);
   void sendNativeTxParameters();
   void runMacro(int index);
   void editMacro(int index);
@@ -84,7 +85,7 @@ private:
   int noCarrierBlocks_ = 0;
   bool decodedLocked_ = false;
   QString pendingDecoded_;
-  QDoubleSpinBox *sql_ = nullptr;
+  QSpinBox *sql_ = nullptr;
   QCheckBox *contestMode_ = nullptr;
   QComboBox *contestType_ = nullptr;
   QLineEdit *contestExchange_ = nullptr;
@@ -96,6 +97,9 @@ private:
   QLineEdit *qsoReceived_ = nullptr;
   QPlainTextEdit *log_ = nullptr;
   QPlainTextEdit *decoder_ = nullptr;
+  QCheckBox *writeLog_ = nullptr;
+  QString monitorLogActivePath_;
+  bool monitorLogHeaderWritten_ = false;
   QPlainTextEdit *txInput_ = nullptr;
   bool txEchoLineActive_ = false;
   QLabel *txStatus_ = nullptr;
