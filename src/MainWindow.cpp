@@ -483,6 +483,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     font.setWeight(QFont::Normal);
     font.setStyleHint(QFont::Monospace);
     decoder_->setFont(font);
+#ifdef Q_OS_WIN
+    if (txInput_) txInput_->setFont(font);
+#endif
     QSettings().setValue(QStringLiteral("ui/decoderFontSize"), size);
   });
   setupPopup->addSeparator();
@@ -685,7 +688,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   log_->setObjectName(QStringLiteral("tciLog"));
   log_->setReadOnly(true);
   log_->setStyleSheet(QStringLiteral("QPlainTextEdit { background: #191a1b; color: #a8a8a8; border: 0; }"));
-  log_->setFont(QFont(QStringLiteral("JetBrains Mono"), 11));
+  QFont tciFont(QStringLiteral("JetBrains Mono"), 11);
+#ifdef Q_OS_WIN
+  tciFont.setPointSize(tciFont.pointSize() - 2);
+#endif
+  log_->setFont(tciFont);
   log_->document()->setMaximumBlockCount(1000);
   log_->setMinimumWidth(240);
   log_->setFixedHeight(200);
@@ -893,7 +900,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   txInput_->setPlaceholderText(QStringLiteral("Enter RTTY text to transmit"));
   txInput_->setFixedHeight(52);
   txInput_->setStyleSheet(QStringLiteral("QPlainTextEdit { background: #0e0e0e; color: #e0e0e0; border: 0; }"));
+#ifdef Q_OS_WIN
+  txInput_->setFont(decoder_->font());
+#else
   txInput_->setFont(QFont(QStringLiteral("Menlo"), 14));
+#endif
   uppercaseTxEditor(txInput_);
   connect(clearTx, &QPushButton::clicked, txInput_, &QPlainTextEdit::clear);
   layout->addWidget(txInput_);
