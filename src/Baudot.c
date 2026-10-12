@@ -24,7 +24,6 @@ char baudot_decode(BAUDOT_DECODER *decoder, uint8_t symbol) {
   if (decoder == 0) {
     return '\0';
   }
-
   symbol &= 0x1f;
   if (symbol == BAUDOT_SHIFT_FIGURES) {
     decoder->state = BAUDOT_FIGURES;
@@ -34,7 +33,6 @@ char baudot_decode(BAUDOT_DECODER *decoder, uint8_t symbol) {
     decoder->state = BAUDOT_LETTERS;
     return '\0';
   }
-
   /*
    * RX Unshift On Space (UOS): a space is identical in both ITA2 shifts.
    * Return the decoded space first, but recover the decoder to LTRS for
@@ -45,6 +43,5 @@ char baudot_decode(BAUDOT_DECODER *decoder, uint8_t symbol) {
     decoder->state = BAUDOT_LETTERS;
     return ' ';
   }
-
   return (decoder->state == BAUDOT_FIGURES) ? figures[symbol] : letters[symbol];
 }

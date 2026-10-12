@@ -2,6 +2,7 @@
 /build-*/
 /dist*
 /.DS_Store
+*.orig
 *.o
 *.tgz
 *.patch
