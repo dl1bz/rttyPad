@@ -26,6 +26,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QKeyEvent>
 #include <QSet>
 #include <QDoubleSpinBox>
 #include <QCheckBox>
@@ -416,6 +417,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
           QStringLiteral("Save SDR mode and DIGI offsets, select DIGL for RTTY, restore on disconnect. Changes take effect on next connection."));
   connect(autoSetupAction, &QAction::toggled, this, [](bool enabled) {
     QSettings().setValue(QStringLiteral("tci/autoSetupDeskHPSDR"), enabled);
+  });
+  auto *bandSetupAction = setupPopup->addAction(QStringLiteral("Auto Setup on Band Change"));
+  bandSetupAction->setCheckable(true);
+  bandSetupAction->setChecked(QSettings().value(QStringLiteral("tci/autoSetupBandChange"), true).toBool());
+  bandSetupAction->setEnabled(autoSetupAction->isChecked());
+  bandSetupAction->setToolTip(QStringLiteral("Reapply DIGL and RTTY pitch after a TCI band change. Takes effect on next connection."));
+  connect(autoSetupAction, &QAction::toggled, bandSetupAction, &QAction::setEnabled);
+  connect(bandSetupAction, &QAction::toggled, this, [](bool enabled) {
+    QSettings().setValue(QStringLiteral("tci/autoSetupBandChange"), enabled);
   });
   setupPopup->addSeparator();
   auto *sendLogAction = setupPopup->addAction(QStringLiteral("Send log via UDP"));
@@ -906,7 +916,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   txInput_->setFont(QFont(QStringLiteral("Menlo"), 14));
 #endif
   uppercaseTxEditor(txInput_);
-  connect(clearTx, &QPushButton::clicked, txInput_, &QPlainTextEdit::clear);
+  txInput_->installEventFilter(this);
+  connect(clearTx, &QPushButton::clicked, this, [this] {
+    if (!liveTxActive_) { txInput_->clear(); liveTxCommitted_ = 0; }
+  });
   layout->addWidget(txInput_);
   // AppKit echoes outgoing text into the decoded traffic pane, not a
   // separate widget below the TX editor.
@@ -927,19 +940,25 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   layout->addLayout(macroRow);
   refreshMacroButtons();
   connect(sendButton_, &QPushButton::clicked, this, [this] {
-    const QString message = txInput_->toPlainText();
-    if (tx_.send(message)) {
-      appendTxTraffic(message);
-      txInput_->clear();
-    }
+    if (liveTxActive_) { return; }
+    if (!tx_.start()) { updateTxUi(); return; }
+    liveTxActive_ = true;
+    liveTxCommitted_ = 0;
+    txInput_->clear();
+    txEchoLineActive_ = false;
+    txInput_->setFocus();
     updateTxUi();
   });
   connect(drainButton_, &QPushButton::clicked, this, [this] {
-    tx_.drain();
+    if (tx_.drain()) { liveTxActive_ = false; }
     updateTxUi();
   });
   connect(stopButton_, &QPushButton::clicked, this, [this] {
     tx_.stop();
+    liveTxActive_ = false;
+    liveTxCommitted_ = 0;
+    txInput_->clear();
+    txEchoLineActive_ = false;
     updateTxUi();
   });
   connect(&tx_, &NativeRTTYTx::stateChanged, this, [this](NativeRTTYTx::State) {
@@ -2029,6 +2048,9 @@ void MainWindow::beginRttySession() {
   snapshotModeReady_ = snapshotDiglReady_ = snapshotDiguReady_ = false;
   sessionChangedMode_ = sessionChangedDigl_ = sessionChangedDigu_ = false;
   sessionRestoring_ = false;
+  lastAutoSetupBand_ = 0;
+  pendingAutoSetupBand_ = false;
+  autoSetupBandChangeSession_ = QSettings().value(QStringLiteral("tci/autoSetupBandChange"), true).toBool();
   // Freeze the preference for this connection; toggling Setup mid-session
   // must not discard a pending restoration or start an incomplete snapshot.
   autoSetupSession_ = QSettings().value(QStringLiteral("tci/autoSetupDeskHPSDR"), true).toBool();
@@ -2038,6 +2060,17 @@ void MainWindow::beginRttySession() {
   tci_.sendText(QStringLiteral("digl_offset;"));
   tci_.sendText(QStringLiteral("digu_offset;"));
   const quint64 generation = sessionGeneration_;
+  auto *bandRetry = new QTimer(this);
+  bandRetry->setInterval(200);
+  connect(bandRetry, &QTimer::timeout, this, [this, generation, bandRetry] {
+    if (generation != sessionGeneration_ || !tci_.isConnected() || sessionRestoring_) {
+      bandRetry->stop();
+      bandRetry->deleteLater();
+      return;
+    }
+    applyPendingBandAutoSetup();
+  });
+  bandRetry->start();
   QTimer::singleShot(2000, this, [this, generation] {
     if (generation != sessionGeneration_ || !tci_.isConnected() || sessionRestoring_)
       return;
@@ -2061,6 +2094,36 @@ void MainWindow::maybeStartRttySession() {
     tci_.sendText(QStringLiteral("digl_offset:%1;").arg(qRound(requestedRttyPitchHz_)));
   }
   // The DIGU offset is never modified automatically.
+  applyPendingBandAutoSetup();
+}
+
+int MainWindow::tciBandForFrequency(double hz) const {
+  static const struct { double low, high; int band; } bands[] = {
+    {1800000, 2000000, 160}, {3500000, 4000000, 80},
+    {5351000, 5367000, 60}, {7000000, 7300000, 40},
+    {10100000, 10150000, 30}, {14000000, 14350000, 20},
+    {18068000, 18168000, 17}, {21000000, 21450000, 15},
+    {24890000, 24990000, 12}, {28000000, 29700000, 10},
+    {50000000, 54000000, 6}
+  };
+  for (const auto &entry : bands) {
+    if (hz >= entry.low && hz <= entry.high) return entry.band;
+  }
+  return 0;
+}
+
+void MainWindow::applyPendingBandAutoSetup() {
+  if (!pendingAutoSetupBand_ || !autoSetupSession_ || !autoSetupBandChangeSession_ ||
+      !sessionStarted_ || sessionRestoring_ || !nativeRttyConfirmed_ || !tci_.isConnected()) return;
+  if (tx_.state() == NativeRTTYTx::State::Sending ||
+      tx_.state() == NativeRTTYTx::State::Draining) return;
+  pendingAutoSetupBand_ = false;
+  tci_.sendText(QStringLiteral("modulation:0,DIGL;"));
+  tci_.sendText(QStringLiteral("digl_offset:%1;").arg(qRound(requestedRttyPitchHz_)));
+  // These settings may differ from the initial snapshot even if the original
+  // values already matched DIGL/pitch. Restore must still run on disconnect.
+  sessionChangedMode_ = true;
+  sessionChangedDigl_ = true;
 }
 
 void MainWindow::disconnectRestoringSession() {
@@ -2169,7 +2232,17 @@ void MainWindow::processTciParameters(const QString &message) {
     for (qsizetype i = args.size(); i-- > 0;) {
       const double hz = args.at(i).trimmed().toDouble(&ok);
       if (ok && hz >= 100000.0 && hz <= 10000000000.0) {
+        if (command == QStringLiteral("vfo") || command == QStringLiteral("frequency") ||
+            command == QStringLiteral("rx_frequency")) {
+          const int band = tciBandForFrequency(hz);
+          if (band != 0) {
+            if (lastAutoSetupBand_ != 0 && lastAutoSetupBand_ != band &&
+                autoSetupSession_ && autoSetupBandChangeSession_) pendingAutoSetupBand_ = true;
+            lastAutoSetupBand_ = band;
+          }
+        }
         tciFrequencyHz_ = hz;
+        applyPendingBandAutoSetup();
         updateRxStatus();
         break;
       }
@@ -2200,6 +2273,33 @@ void MainWindow::sendNativeTxParameters() {
 }
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
+  if (watched == txInput_ && liveTxActive_ && event->type() == QEvent::KeyPress) {
+    auto *key = static_cast<QKeyEvent *>(event);
+    const int code = key->key();
+    const bool space = code == Qt::Key_Space;
+    const bool enter = code == Qt::Key_Return || code == Qt::Key_Enter;
+    QTextCursor cursor = txInput_->textCursor();
+    const QString contents = txInput_->toPlainText();
+    // Transmitted characters are immutable until TX OFF clears the buffer.
+    if (cursor.selectionStart() < liveTxCommitted_ || cursor.position() < liveTxCommitted_) {
+      if (code == Qt::Key_Backspace || code == Qt::Key_Delete ||
+          (!key->text().isEmpty() && !(key->modifiers() & Qt::ControlModifier))) {
+        return true;
+      }
+    }
+    if (space || enter) {
+      if (cursor.hasSelection() || cursor.position() != contents.size()) { return true; }
+      const QString pending = contents.mid(liveTxCommitted_);
+      const QString payload = pending + (enter ? QStringLiteral("\r\n") : QStringLiteral(" "));
+      if (!tx_.send(payload)) { return true; }
+      appendTxTraffic(payload);
+      // Keep the complete visible text, including the delimiter.
+      cursor.insertText(enter ? QStringLiteral("\n") : QStringLiteral(" "));
+      liveTxCommitted_ = txInput_->toPlainText().size();
+      return true;
+    }
+  }
+
   if (event->type() == QEvent::FocusIn) {
     if (watched == qsoCall_) { decodePickTarget_ = DecodePickTarget::Call; }
     else if (watched == qsoName_) { decodePickTarget_ = DecodePickTarget::Name; }

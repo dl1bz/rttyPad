@@ -38,6 +38,8 @@ private:
   void beginRttySession();
   void failNativeRttyCheck();
   void maybeStartRttySession();
+  int tciBandForFrequency(double hz) const;
+  void applyPendingBandAutoSetup();
   void disconnectRestoringSession();
   double rxCenterHz() const;
   bool rxReverse() const;
@@ -102,6 +104,8 @@ private:
   bool monitorLogHeaderWritten_ = false;
   QPlainTextEdit *txInput_ = nullptr;
   bool txEchoLineActive_ = false;
+  int liveTxCommitted_ = 0;
+  bool liveTxActive_ = false;
   QLabel *txStatus_ = nullptr;
   QComboBox *txFill_ = nullptr;
   QComboBox *txStopBits_ = nullptr;
@@ -120,6 +124,9 @@ private:
   bool snapshotDiglReady_ = false;
   bool snapshotDiguReady_ = false;
   bool autoSetupSession_ = true;
+  bool autoSetupBandChangeSession_ = true;
+  int lastAutoSetupBand_ = 0;
+  bool pendingAutoSetupBand_ = false;
   bool nativeRttyConfirmed_ = false;
   bool nativeRttyCheckPending_ = false;
   quint64 nativeRttyCheckGeneration_ = 0;
