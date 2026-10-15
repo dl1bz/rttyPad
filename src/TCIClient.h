@@ -10,6 +10,7 @@ struct TCIStreamInfo {
   bool valid = false;
   bool payloadSizeMatches = false;
   bool isRxAudioFloat32 = false;
+  bool isIQFloat32 = false;
   quint32 receiver = 0;
   quint32 sampleRate = 0;
   quint32 format = 0;
@@ -45,6 +46,7 @@ signals:
   void textMessageReceived(const QString &message);
   void binaryMessageReceived(qsizetype length, TCIStreamInfo info);
   void rxAudioFrameReceived(const QByteArray &data, TCIStreamInfo info);
+  void iqFrameReceived(const QByteArray &data, TCIStreamInfo info);
 
 private:
   static TCIStreamInfo parseStreamInfo(const QByteArray &data);

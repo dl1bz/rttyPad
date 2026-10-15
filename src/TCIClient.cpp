@@ -41,6 +41,7 @@ TCIClient::TCIClient(QObject *parent) : QObject(parent) {
     if (info.isRxAudioFloat32) {
       emit rxAudioFrameReceived(data, info);
     }
+    if (info.isIQFloat32) emit iqFrameReceived(data, info);
   });
   connect(&socket_, &QWebSocket::disconnected, this, [this] {
     // Notify consumers on both intentional and unexpected disconnects.
@@ -83,6 +84,7 @@ void TCIClient::disconnectFromHost() {
   intentionallyClosed_ = true;
   ++connectionGeneration_;
   if (isConnected()) {
+    sendText(QStringLiteral("iq_stop:0;"));
     sendText(QStringLiteral("audio_stop:0;"));
     socket_.close(QWebSocketProtocol::CloseCodeNormal);
   } else {
@@ -115,7 +117,8 @@ void TCIClient::sendInitialTCICommands() {
     QStringLiteral("audio_stream_sample_type:float32;"),
     QStringLiteral("audio_stream_channels:1;"),
     QStringLiteral("audio_stream_samples;"),
-    QStringLiteral("audio_start:0;")
+    QStringLiteral("audio_start:0;"),
+    QStringLiteral("iq_start:0;")
   };
   for (int i = 0; i < commands.size(); ++i) {
     QTimer::singleShot((i + 1) * 50, this, [this, generation, cmd = commands.at(i)] {
@@ -164,6 +167,7 @@ TCIStreamInfo TCIClient::parseStreamInfo(const QByteArray &data) {
                             quint64(info.payloadLength) >= info.expectedPayloadLength;
   info.valid = info.channels > 0 && info.length > 0 && info.payloadSizeMatches;
   info.audioFrames = info.channels ? info.length / info.channels : 0;
+  info.isIQFloat32 = info.valid && info.type == 0 && info.format == kFloat32 && info.channels == 2;
   info.isRxAudioFloat32 = info.valid && info.type == kRxAudio &&
                           info.format == kFloat32 && info.audioFrames > 0;
   if (info.isRxAudioFloat32) {

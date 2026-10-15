@@ -25,6 +25,8 @@ add_executable(rttyPad
     src/MainWindow.h
     src/RTTYScopeWidget.cpp
     src/RTTYScopeWidget.h
+    src/RTTYIQPanWidget.cpp
+    src/RTTYIQPanWidget.h
     src/TCIClient.cpp
     src/TCIClient.h
     src/NativeRTTYTx.cpp

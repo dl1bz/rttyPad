@@ -8,6 +8,7 @@
 
 class QLabel;
 class RTTYScopeWidget;
+class RTTYIQPanWidget;
 class QDoubleSpinBox;
 class QCheckBox;
 class QComboBox;
@@ -78,6 +79,8 @@ private:
   double afcErrorHz_ = 0.0;
   bool afcValid_ = false;
   RTTYScopeWidget *scopeWidget_ = nullptr;
+  RTTYIQPanWidget *iqPan_ = nullptr;
+  double iqDragStartFrequencyHz_ = 0.0;
   QDoubleSpinBox *center_ = nullptr;
   QDoubleSpinBox *shift_ = nullptr;
   QDoubleSpinBox *baud_ = nullptr;
@@ -106,6 +109,7 @@ private:
   bool txEchoLineActive_ = false;
   int liveTxCommitted_ = 0;
   bool liveTxActive_ = false;
+  bool txOffDraining_ = false;
   QLabel *txStatus_ = nullptr;
   QComboBox *txFill_ = nullptr;
   QComboBox *txStopBits_ = nullptr;
